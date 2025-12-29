@@ -266,6 +266,59 @@ class SonarrMonitor extends ArrClient {
     }
   }
 
+  parseEpisodeInfo(jobName) {
+    // Try to extract season and episode numbers from release name
+    // Supports formats: S01E02, S01E02E03, 1x02, etc.
+    const patterns = [
+      /[Ss](\d+)[Ee](\d+)(?:[Ee](\d+))?/,  // S01E02 or S01E02E03
+      /(\d+)x(\d+)/,                        // 1x02
+      /[Ee]pisode[.\s](\d+)/i,              // Episode 02
+    ];
+
+    for (const pattern of patterns) {
+      const match = jobName.match(pattern);
+      if (match) {
+        const season = parseInt(match[1]) || 1;
+        const episode = parseInt(match[2]);
+        return { season, episode };
+      }
+    }
+
+    return null;
+  }
+
+  async getEpisode(seriesId, season, episode) {
+    try {
+      const response = await this.axios.get(`/api/${this.apiVersion}/episode`, {
+        params: { seriesId }
+      });
+      const episodes = response.data || [];
+      return episodes.find(e => e.seasonNumber === season && e.episodeNumber === episode);
+    } catch (error) {
+      log(this.name, `Error fetching episodes: ${error.message}`);
+      return null;
+    }
+  }
+
+  async registerEpisodeFile(episodeFile, episodeIds) {
+    try {
+      const payload = {
+        path: episodeFile.path,
+        seriesId: episodeFile.seriesId,
+        episodeIds: episodeIds,
+        quality: episodeFile.quality,
+        releaseGroup: episodeFile.releaseGroup,
+        sceneName: episodeFile.sceneName
+      };
+
+      const response = await this.axios.post(`/api/${this.apiVersion}/episodefile`, payload);
+      return response.data;
+    } catch (error) {
+      log(this.name, `Error registering episode file: ${error.message}`);
+      return null;
+    }
+  }
+
   async processHistory(nzbdavHistory) {
     const allSeries = await this.getAllSeries();
 
@@ -275,6 +328,13 @@ class SonarrMonitor extends ArrClient {
 
       // Only process TV category
       if (!category.includes('tv') && !category.includes('sonarr')) continue;
+
+      // Parse episode information
+      const episodeInfo = this.parseEpisodeInfo(jobName);
+      if (!episodeInfo) {
+        log(this.name, `Could not parse episode info from: ${jobName}`);
+        continue;
+      }
 
       const normalizedJob = this.normalizeTitle(jobName);
 
@@ -289,26 +349,56 @@ class SonarrMonitor extends ArrClient {
         continue;
       }
 
-      const actualPath = this.findActualPath(series.title, this.config.mountPath);
-      if (!actualPath) continue;
-
-      if (actualPath === series.path) {
-        log(this.name, `Path already correct: ${series.title}`);
+      // Get the specific episode
+      const episode = await this.getEpisode(series.id, episodeInfo.season, episodeInfo.episode);
+      if (!episode) {
+        log(this.name, `Episode S${episodeInfo.season}E${episodeInfo.episode} not found for ${series.title}`);
         continue;
       }
 
-      log(this.name, `Updating path from ${series.path} to ${actualPath}`);
+      // Check if episode already has a file
+      if (episode.hasFile) {
+        log(this.name, `${series.title} S${episodeInfo.season}E${episodeInfo.episode} already has file`);
+        continue;
+      }
+
+      // Find the actual video file in the download directory
+      const downloadPath = path.join(this.config.mountPath, jobName);
+      let videoFile = null;
+
+      try {
+        if (fs.existsSync(downloadPath)) {
+          const files = fs.readdirSync(downloadPath);
+          videoFile = files.find(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+        }
+      } catch (error) {
+        log(this.name, `Error scanning directory ${downloadPath}: ${error.message}`);
+        continue;
+      }
+
+      if (!videoFile) {
+        log(this.name, `No video file found in ${downloadPath}`);
+        continue;
+      }
+
+      const fullPath = path.join(downloadPath, videoFile);
+      log(this.name, `Registering ${series.title} S${episodeInfo.season}E${episodeInfo.episode}: ${fullPath}`);
 
       if (!CONFIG.dryRun) {
-        series.path = actualPath;
-        const updated = await this.updateItem(series.id, 'series', series);
+        const episodeFile = {
+          path: fullPath,
+          seriesId: series.id,
+          quality: { quality: { id: 1, name: 'Unknown' } },
+          releaseGroup: '',
+          sceneName: jobName
+        };
 
-        if (updated) {
-          log(this.name, `Triggering refresh for: ${series.title}`);
-          await this.triggerCommand({ name: 'RefreshSeries', seriesId: series.id });
+        const registered = await this.registerEpisodeFile(episodeFile, [episode.id]);
+        if (registered) {
+          log(this.name, `✅ Successfully registered: ${series.title} S${episodeInfo.season}E${episodeInfo.episode}`);
         }
       } else {
-        log(this.name, `[DRY RUN] Would update path and refresh`);
+        log(this.name, `[DRY RUN] Would register episode file: ${fullPath}`);
       }
     }
   }
