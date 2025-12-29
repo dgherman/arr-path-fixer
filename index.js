@@ -35,9 +35,10 @@ const log = (service, message) => {
 
 // Generic API client for *arr services
 class ArrClient {
-  constructor(name, config) {
+  constructor(name, config, apiVersion = 'v3') {
     this.name = name;
     this.config = config;
+    this.apiVersion = apiVersion;
     this.axios = axios.create({
       baseURL: config.url,
       headers: { 'X-Api-Key': config.apiKey }
@@ -46,7 +47,7 @@ class ArrClient {
 
   async getQueue() {
     try {
-      const response = await this.axios.get('/api/v3/queue');
+      const response = await this.axios.get(`/api/${this.apiVersion}/queue`);
       return response.data.records || [];
     } catch (error) {
       log(this.name, `Error fetching queue: ${error.message}`);
@@ -56,7 +57,7 @@ class ArrClient {
 
   async getItem(id, endpoint) {
     try {
-      const response = await this.axios.get(`/api/v3/${endpoint}/${id}`);
+      const response = await this.axios.get(`/api/${this.apiVersion}/${endpoint}/${id}`);
       return response.data;
     } catch (error) {
       log(this.name, `Error fetching item ${id}: ${error.message}`);
@@ -66,7 +67,7 @@ class ArrClient {
 
   async updateItem(id, endpoint, data) {
     try {
-      const response = await this.axios.put(`/api/v3/${endpoint}/${id}?moveFiles=false`, data);
+      const response = await this.axios.put(`/api/${this.apiVersion}/${endpoint}/${id}?moveFiles=false`, data);
       return response.data;
     } catch (error) {
       log(this.name, `Error updating item ${id}: ${error.message}`);
@@ -76,7 +77,7 @@ class ArrClient {
 
   async triggerCommand(command) {
     try {
-      await this.axios.post('/api/v3/command', command);
+      await this.axios.post(`/api/${this.apiVersion}/command`, command);
       return true;
     } catch (error) {
       log(this.name, `Error triggering command: ${error.message}`);
@@ -86,7 +87,7 @@ class ArrClient {
 
   async removeFromQueue(id) {
     try {
-      await this.axios.delete(`/api/v3/queue/${id}?removeFromClient=false&blocklist=false`);
+      await this.axios.delete(`/api/${this.apiVersion}/queue/${id}?removeFromClient=false&blocklist=false`);
       return true;
     } catch (error) {
       log(this.name, `Error removing from queue: ${error.message}`);
@@ -293,7 +294,7 @@ async function monitorAll() {
     monitors.push(new SonarrMonitor('Sonarr', CONFIG.sonarr));
   }
   if (CONFIG.lidarr.enabled) {
-    monitors.push(new LidarrMonitor('Lidarr', CONFIG.lidarr));
+    monitors.push(new LidarrMonitor('Lidarr', CONFIG.lidarr, 'v1'));
   }
 
   if (monitors.length === 0) {
