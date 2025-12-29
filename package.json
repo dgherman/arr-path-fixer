@@ -1,0 +1,14 @@
+{
+  "name": "arr-path-fixer",
+  "version": "1.0.0",
+  "description": "Automatically fixes paths for Radarr/Sonarr/Lidarr in streaming setups",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "author": "",
+  "license": "MIT"
+}
