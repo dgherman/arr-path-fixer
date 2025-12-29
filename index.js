@@ -158,6 +158,7 @@ async function fetchNzbdavHistory() {
   try {
     const params = {
       mode: 'history',
+      apikey: CONFIG.nzbdav.apiKey,
       start: '0',
       limit: String(CONFIG.nzbdav.historyLimit),
       output: 'json'
