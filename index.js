@@ -302,16 +302,22 @@ class SonarrMonitor extends ArrClient {
 
   async registerEpisodeFile(episodeFile, episodeIds) {
     try {
-      const payload = {
+      // Use the command API with ManualImport to register the episode file
+      const files = [{
         path: episodeFile.path,
         seriesId: episodeFile.seriesId,
         episodeIds: episodeIds,
         quality: episodeFile.quality,
-        releaseGroup: episodeFile.releaseGroup,
-        sceneName: episodeFile.sceneName
+        releaseGroup: episodeFile.releaseGroup || ''
+      }];
+
+      const command = {
+        name: 'ManualImport',
+        files: files,
+        importMode: 'auto'
       };
 
-      const response = await this.axios.post(`/api/${this.apiVersion}/episodefile`, payload);
+      const response = await this.axios.post(`/api/${this.apiVersion}/command`, command);
       return response.data;
     } catch (error) {
       log(this.name, `Error registering episode file: ${error.message}`);
