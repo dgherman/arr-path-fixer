@@ -13,13 +13,15 @@ When using NzbDAV for streaming:
 ## Solution
 
 This service:
-1. Monitors *arr service queues for completed downloads
-2. Finds where NzbDAV actually created the file
-3. Updates the movie/series/album path to match reality
-4. Triggers refresh → file is detected
-5. Clears the queue
+1. Monitors NzbDAV history API for completed downloads
+2. Matches completed downloads to *arr items (movies/series/albums)
+3. Finds where NzbDAV actually created the file
+4. Updates the *arr item path to match reality
+5. Triggers refresh → file is detected
 
 **No file moves = No bandwidth waste = No failed imports**
+
+Works with Completed Download Handling disabled, avoiding the race condition where imports fail before paths can be fixed.
 
 ## Deployment
 
@@ -79,11 +81,15 @@ version: '3.8'
 
 services:
   arr-path-fixer:
-    image: arr-path-fixer:latest
+    image: ghcr.io/dgherman/arr-path-fixer:latest
     container_name: arr-path-fixer
     restart: unless-stopped
     network_mode: host
     environment:
+      NZBDAV_URL: "http://localhost:5080"
+      NZBDAV_API_KEY: "your-nzbdav-api-key"
+      NZBDAV_HISTORY_LIMIT: "50"
+
       RADARR_ENABLED: "true"
       RADARR_URL: "http://localhost:7878"
       RADARR_API_KEY: "your-api-key"
@@ -111,6 +117,9 @@ services:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `NZBDAV_URL` | **Required** - NzbDAV URL | - |
+| `NZBDAV_API_KEY` | **Required** - NzbDAV API key | - |
+| `NZBDAV_HISTORY_LIMIT` | Number of history items to fetch | `50` |
 | `RADARR_ENABLED` | Enable Radarr monitoring | `false` |
 | `RADARR_URL` | Radarr URL | - |
 | `RADARR_API_KEY` | Radarr API key | - |
@@ -123,7 +132,7 @@ services:
 | `LIDARR_URL` | Lidarr URL | - |
 | `LIDARR_API_KEY` | Lidarr API key | - |
 | `LIDARR_MOUNT_PATH` | Path to music | `/mnt/nzbdav/content/music` |
-| `POLL_INTERVAL_SECONDS` | How often to check queues | `60` |
+| `POLL_INTERVAL_SECONDS` | How often to check NzbDAV history | `60` |
 | `DRY_RUN` | Test mode (no changes made) | `false` |
 
 ## Testing
@@ -162,18 +171,21 @@ podman logs -f arr-path-fixer
 
 ### Service won't start
 - Check environment file exists: `cat ~/arr-path-fixer/.env`
-- Verify API keys are correct
+- Verify NzbDAV URL and API key are set correctly
+- Verify *arr API keys are correct
 - Check mount path is accessible: `ls /mnt/nzbdav/content/`
 
 ### Not detecting files
-- Verify Completed Download Handling is **DISABLED** in *arr apps
-- Check queue has items with `importBlocked` (Radarr) or `importPending` (Sonarr/Lidarr) status
+- Check NzbDAV history has completed downloads
+- Verify categories match in NzbDAV (Movies/TV/Music)
 - Ensure poll interval isn't too long
+- Check logs for "No matching movie/series/artist found" messages
 
 ### Wrong paths being set
 - Check mount paths match your setup
 - Verify NzbDAV creates files where expected
 - Enable dry run and check logs
+- Check title normalization is matching correctly
 
 ## Architecture
 
@@ -181,22 +193,30 @@ podman logs -f arr-path-fixer
 ┌─────────────────────────────────────────┐
 │ arr-path-fixer Container                │
 │                                          │
-│  Monitors:                               │
-│  - Radarr queue (every 60s)             │
-│  - Sonarr queue (every 60s)             │
-│  - Lidarr queue (every 60s)             │
+│  1. Fetch NzbDAV history (every 60s)    │
+│     - Only completed downloads           │
+│     - Filter by category                 │
 │                                          │
-│  For completed items:                    │
-│  1. Find actual file location           │
-│  2. Update *arr item path                │
-│  3. Trigger refresh                      │
-│  4. Clear queue                          │
+│  2. Match to *arr items by title        │
+│     - Normalized title comparison        │
+│                                          │
+│  3. For each match:                      │
+│     - Find actual file location          │
+│     - Update *arr item path              │
+│     - Trigger refresh                    │
 └─────────────────────────────────────────┘
          │              │              │
          ▼              ▼              ▼
     ┌────────┐    ┌────────┐    ┌────────┐
     │ Radarr │    │ Sonarr │    │ Lidarr │
     └────────┘    └────────┘    └────────┘
+         │              │              │
+         └──────────────┴──────────────┘
+                    │
+                    ▼
+              ┌──────────┐
+              │  NzbDAV  │
+              └──────────┘
 ```
 
 ## License

@@ -6,6 +6,11 @@ const path = require('path');
 
 // Configuration from environment variables
 const CONFIG = {
+  nzbdav: {
+    url: process.env.NZBDAV_URL,
+    apiKey: process.env.NZBDAV_API_KEY,
+    historyLimit: parseInt(process.env.NZBDAV_HISTORY_LIMIT || '50')
+  },
   radarr: {
     enabled: process.env.RADARR_ENABLED === 'true',
     url: process.env.RADARR_URL,
@@ -134,28 +139,92 @@ class ArrClient {
       return null;
     }
   }
+
+  normalizeTitle(title) {
+    // Remove special characters, year, quality tags, etc. for matching
+    return title
+      .toLowerCase()
+      .replace(/\b(19|20)\d{2}\b/g, '') // Remove years
+      .replace(/\b(480|720|1080|2160)p?\b/gi, '') // Remove resolutions
+      .replace(/\b(bluray|webrip|webdl|hdtv|brrip|dvdrip|remux|avc|hevc|x264|x265)\b/gi, '')
+      .replace(/\b(dts|ac3|aac|ma|flac|mp3|m4a)\b/gi, '') // Remove audio codecs
+      .replace(/[^a-z0-9]/g, '')
+      .trim();
+  }
+}
+
+// NzbDAV history fetcher
+async function fetchNzbdavHistory() {
+  try {
+    const params = {
+      mode: 'history',
+      start: '0',
+      limit: String(CONFIG.nzbdav.historyLimit),
+      output: 'json'
+    };
+
+    const headers = {};
+    if (CONFIG.nzbdav.apiKey) {
+      headers['x-api-key'] = CONFIG.nzbdav.apiKey;
+    }
+
+    const response = await axios.get(`${CONFIG.nzbdav.url}/api`, {
+      params,
+      headers,
+      timeout: 10000
+    });
+
+    const history = response.data?.history || response.data?.History;
+    const slots = history?.slots || history?.Slots || [];
+
+    // Only return completed items
+    return slots.filter(slot => {
+      const status = (slot?.status || slot?.Status || '').toString().toLowerCase();
+      return status === 'completed';
+    });
+  } catch (error) {
+    log('NzbDAV', `Error fetching history: ${error.message}`);
+    return [];
+  }
 }
 
 // Radarr-specific handler
 class RadarrMonitor extends ArrClient {
-  async processQueue() {
-    const queue = await this.getQueue();
-    const completed = queue.filter(item =>
-      item.status === 'completed' &&
-      item.trackedDownloadState === 'importBlocked'
-    );
+  async getAllMovies() {
+    try {
+      const response = await this.axios.get(`/api/${this.apiVersion}/movie`);
+      return response.data || [];
+    } catch (error) {
+      log(this.name, `Error fetching movies: ${error.message}`);
+      return [];
+    }
+  }
 
-    for (const queueItem of completed) {
-      log(this.name, `Processing: ${queueItem.title}`);
+  async processHistory(nzbdavHistory) {
+    const movies = await this.getAllMovies();
 
-      const movie = await this.getItem(queueItem.movieId, 'movie');
-      if (!movie) continue;
+    for (const historyItem of nzbdavHistory) {
+      const jobName = historyItem.job_name || historyItem.name || '';
+      const category = (historyItem.category || historyItem.Category || '').toLowerCase();
 
+      // Only process movies category
+      if (!category.includes('movie')) continue;
+
+      const normalizedJob = this.normalizeTitle(jobName);
+
+      // Find matching movie
+      const movie = movies.find(m => {
+        const normalizedTitle = this.normalizeTitle(m.title);
+        return normalizedJob.includes(normalizedTitle) || normalizedTitle.includes(normalizedJob);
+      });
+
+      if (!movie) {
+        log(this.name, `No matching movie found for: ${jobName}`);
+        continue;
+      }
+
+      // Skip if already has file
       if (movie.hasFile) {
-        log(this.name, `Movie already has file, removing from queue: ${movie.title}`);
-        if (!CONFIG.dryRun) {
-          await this.removeFromQueue(queueItem.id);
-        }
         continue;
       }
 
@@ -176,15 +245,6 @@ class RadarrMonitor extends ArrClient {
         if (updated) {
           log(this.name, `Triggering refresh for: ${movie.title}`);
           await this.triggerCommand({ name: 'RefreshMovie', movieIds: [movie.id] });
-
-          // Wait a bit for refresh, then check if file detected
-          setTimeout(async () => {
-            const refreshed = await this.getItem(movie.id, 'movie');
-            if (refreshed && refreshed.hasFile) {
-              log(this.name, `✅ Successfully imported: ${movie.title}`);
-              await this.removeFromQueue(queueItem.id);
-            }
-          }, 5000);
         }
       } else {
         log(this.name, `[DRY RUN] Would update path and refresh`);
@@ -195,18 +255,38 @@ class RadarrMonitor extends ArrClient {
 
 // Sonarr-specific handler
 class SonarrMonitor extends ArrClient {
-  async processQueue() {
-    const queue = await this.getQueue();
-    const completed = queue.filter(item =>
-      item.status === 'completed' &&
-      item.trackedDownloadState === 'importPending'
-    );
+  async getAllSeries() {
+    try {
+      const response = await this.axios.get(`/api/${this.apiVersion}/series`);
+      return response.data || [];
+    } catch (error) {
+      log(this.name, `Error fetching series: ${error.message}`);
+      return [];
+    }
+  }
 
-    for (const queueItem of completed) {
-      log(this.name, `Processing: ${queueItem.title}`);
+  async processHistory(nzbdavHistory) {
+    const allSeries = await this.getAllSeries();
 
-      const series = await this.getItem(queueItem.seriesId, 'series');
-      if (!series) continue;
+    for (const historyItem of nzbdavHistory) {
+      const jobName = historyItem.job_name || historyItem.name || '';
+      const category = (historyItem.category || historyItem.Category || '').toLowerCase();
+
+      // Only process TV category
+      if (!category.includes('tv') && !category.includes('sonarr')) continue;
+
+      const normalizedJob = this.normalizeTitle(jobName);
+
+      // Find matching series
+      const series = allSeries.find(s => {
+        const normalizedTitle = this.normalizeTitle(s.title);
+        return normalizedJob.includes(normalizedTitle) || normalizedTitle.includes(normalizedJob);
+      });
+
+      if (!series) {
+        log(this.name, `No matching series found for: ${jobName}`);
+        continue;
+      }
 
       const actualPath = this.findActualPath(series.title, this.config.mountPath);
       if (!actualPath) continue;
@@ -225,11 +305,6 @@ class SonarrMonitor extends ArrClient {
         if (updated) {
           log(this.name, `Triggering refresh for: ${series.title}`);
           await this.triggerCommand({ name: 'RefreshSeries', seriesId: series.id });
-
-          setTimeout(async () => {
-            log(this.name, `✅ Path updated for: ${series.title}`);
-            await this.removeFromQueue(queueItem.id);
-          }, 5000);
         }
       } else {
         log(this.name, `[DRY RUN] Would update path and refresh`);
@@ -240,18 +315,38 @@ class SonarrMonitor extends ArrClient {
 
 // Lidarr-specific handler
 class LidarrMonitor extends ArrClient {
-  async processQueue() {
-    const queue = await this.getQueue();
-    const completed = queue.filter(item =>
-      item.status === 'completed' &&
-      item.trackedDownloadState === 'importPending'
-    );
+  async getAllArtists() {
+    try {
+      const response = await this.axios.get(`/api/${this.apiVersion}/artist`);
+      return response.data || [];
+    } catch (error) {
+      log(this.name, `Error fetching artists: ${error.message}`);
+      return [];
+    }
+  }
 
-    for (const queueItem of completed) {
-      log(this.name, `Processing: ${queueItem.title}`);
+  async processHistory(nzbdavHistory) {
+    const allArtists = await this.getAllArtists();
 
-      const artist = await this.getItem(queueItem.artistId, 'artist');
-      if (!artist) continue;
+    for (const historyItem of nzbdavHistory) {
+      const jobName = historyItem.job_name || historyItem.name || '';
+      const category = (historyItem.category || historyItem.Category || '').toLowerCase();
+
+      // Only process music category
+      if (!category.includes('music') && !category.includes('lidarr')) continue;
+
+      const normalizedJob = this.normalizeTitle(jobName);
+
+      // Find matching artist
+      const artist = allArtists.find(a => {
+        const normalizedName = this.normalizeTitle(a.artistName);
+        return normalizedJob.includes(normalizedName) || normalizedName.includes(normalizedJob);
+      });
+
+      if (!artist) {
+        log(this.name, `No matching artist found for: ${jobName}`);
+        continue;
+      }
 
       const actualPath = this.findActualPath(artist.artistName, this.config.mountPath);
       if (!actualPath) continue;
@@ -270,11 +365,6 @@ class LidarrMonitor extends ArrClient {
         if (updated) {
           log(this.name, `Triggering refresh for: ${artist.artistName}`);
           await this.triggerCommand({ name: 'RefreshArtist', artistId: artist.id });
-
-          setTimeout(async () => {
-            log(this.name, `✅ Path updated for: ${artist.artistName}`);
-            await this.removeFromQueue(queueItem.id);
-          }, 5000);
         }
       } else {
         log(this.name, `[DRY RUN] Would update path and refresh`);
@@ -302,14 +392,25 @@ async function monitorAll() {
     process.exit(1);
   }
 
+  if (!CONFIG.nzbdav.url || !CONFIG.nzbdav.apiKey) {
+    log('Main', 'NzbDAV URL and API key are required!');
+    process.exit(1);
+  }
+
   log('Main', `Starting monitors: ${monitors.map(m => m.name).join(', ')}`);
+  log('Main', `NzbDAV URL: ${CONFIG.nzbdav.url}`);
   log('Main', `Poll interval: ${CONFIG.pollInterval / 1000}s`);
   log('Main', `Dry run: ${CONFIG.dryRun}`);
 
   async function poll() {
+    // Fetch NzbDAV history once
+    const nzbdavHistory = await fetchNzbdavHistory();
+    log('Main', `Found ${nzbdavHistory.length} completed downloads in NzbDAV history`);
+
+    // Process history with each monitor
     for (const monitor of monitors) {
       try {
-        await monitor.processQueue();
+        await monitor.processHistory(nzbdavHistory);
       } catch (error) {
         log(monitor.name, `Error in monitor: ${error.message}`);
       }
