@@ -3,6 +3,7 @@
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const Database = require('better-sqlite3');
 
 // Configuration from environment variables
 const CONFIG = {
@@ -21,7 +22,8 @@ const CONFIG = {
     enabled: process.env.SONARR_ENABLED === 'true',
     url: process.env.SONARR_URL,
     apiKey: process.env.SONARR_API_KEY,
-    mountPath: process.env.SONARR_MOUNT_PATH || '/mnt/nzbdav/content/tv'
+    mountPath: process.env.SONARR_MOUNT_PATH || '/mnt/nzbdav/content/tv',
+    dbPath: process.env.SONARR_DB_PATH || '/config/sonarr/sonarr.db'
   },
   lidarr: {
     enabled: process.env.LIDARR_ENABLED === 'true',
@@ -638,9 +640,10 @@ class SonarrMonitor extends ArrClient {
         const episodeFile = {
           path: fullPath,
           seriesId: series.id,
+          seasonNumber: fileEpisodeInfo.season,
           quality: { quality: { id: 1, name: 'Unknown' } },
           releaseGroup: '',
-          sceneName: jobName
+          sceneName: videoFile
         };
 
         const registered = await this.registerEpisodeFile(episodeFile, [episode.id]);
@@ -670,9 +673,118 @@ class SonarrMonitor extends ArrClient {
     }
   }
 
-  async registerEpisodeFile(episodeFile, episodeIds) {
+  getDatabase() {
+    if (!this._db) {
+      if (!fs.existsSync(this.config.dbPath)) {
+        log(this.name, `Database not found at: ${this.config.dbPath}`);
+        return null;
+      }
+      this._db = new Database(this.config.dbPath);
+    }
+    return this._db;
+  }
+
+  async ensureSeriesPath(seriesId) {
+    // Ensure series path is set to mount path root for relative paths to work
+    const db = this.getDatabase();
+    if (!db) return false;
+
     try {
-      // Use the command API with ManualImport to register the episode file
+      const series = db.prepare('SELECT Id, Path FROM Series WHERE Id = ?').get(seriesId);
+      if (series && series.Path !== this.config.mountPath) {
+        log(this.name, `Updating series ${seriesId} path from "${series.Path}" to "${this.config.mountPath}"`);
+        db.prepare('UPDATE Series SET Path = ? WHERE Id = ?').run(this.config.mountPath, seriesId);
+      }
+      return true;
+    } catch (error) {
+      log(this.name, `Error updating series path: ${error.message}`);
+      return false;
+    }
+  }
+
+  async registerEpisodeFile(episodeFile, episodeIds) {
+    const db = this.getDatabase();
+    if (!db) {
+      log(this.name, 'Database not available, falling back to API (will likely fail on read-only filesystem)');
+      return this.registerEpisodeFileViaApi(episodeFile, episodeIds);
+    }
+
+    try {
+      // Ensure series path is set correctly
+      await this.ensureSeriesPath(episodeFile.seriesId);
+
+      // Get file size
+      let fileSize = 0;
+      try {
+        const stats = fs.statSync(episodeFile.path);
+        fileSize = stats.size;
+      } catch (e) {
+        log(this.name, `Could not get file size: ${e.message}`);
+      }
+
+      // Calculate relative path from mount path
+      const relativePath = episodeFile.path.replace(this.config.mountPath + '/', '');
+
+      // Extract release group from scene name
+      const releaseGroupMatch = episodeFile.sceneName?.match(/-([A-Za-z0-9]+)$/);
+      const releaseGroup = releaseGroupMatch ? releaseGroupMatch[1] : '';
+
+      // Check if episode file already exists for this path
+      const existingFile = db.prepare(
+        'SELECT Id FROM EpisodeFiles WHERE SeriesId = ? AND RelativePath = ?'
+      ).get(episodeFile.seriesId, relativePath);
+
+      if (existingFile) {
+        log(this.name, `Episode file already registered with ID ${existingFile.Id}`);
+        // Update episode to link to existing file
+        for (const episodeId of episodeIds) {
+          db.prepare('UPDATE Episodes SET EpisodeFileId = ? WHERE Id = ?').run(existingFile.Id, episodeId);
+        }
+        return { id: existingFile.Id };
+      }
+
+      // Insert new episode file record
+      // Quality format: {"quality": <id>, "revision": {"version": 1, "real": 0, "isRepack": false}}
+      // Languages format: [1] (array of language IDs, 1 = English)
+      const qualityJson = JSON.stringify({
+        quality: 3, // WEBDL-1080p as default
+        revision: { version: 1, real: 0, isRepack: false }
+      });
+      const languagesJson = '[1]'; // English
+
+      const result = db.prepare(`
+        INSERT INTO EpisodeFiles (SeriesId, Quality, Size, DateAdded, SeasonNumber, SceneName, ReleaseGroup, MediaInfo, RelativePath, OriginalFilePath, Languages, IndexerFlags, ReleaseType)
+        VALUES (?, ?, ?, datetime('now'), ?, ?, ?, NULL, ?, NULL, ?, 0, 0)
+      `).run(
+        episodeFile.seriesId,
+        qualityJson,
+        fileSize,
+        episodeFile.seasonNumber || 1,
+        episodeFile.sceneName || '',
+        releaseGroup,
+        relativePath,
+        languagesJson
+      );
+
+      const episodeFileId = result.lastInsertRowid;
+      log(this.name, `Inserted EpisodeFile with ID ${episodeFileId}`);
+
+      // Link episodes to the new file
+      for (const episodeId of episodeIds) {
+        db.prepare('UPDATE Episodes SET EpisodeFileId = ? WHERE Id = ?').run(episodeFileId, episodeId);
+        log(this.name, `Linked episode ${episodeId} to file ${episodeFileId}`);
+      }
+
+      return { id: episodeFileId };
+    } catch (error) {
+      log(this.name, `Error registering episode file via DB: ${error.message}`);
+      return null;
+    }
+  }
+
+  async registerEpisodeFileViaApi(episodeFile, episodeIds) {
+    try {
+      // Fallback to API method (will fail on read-only filesystem)
       const files = [{
         path: episodeFile.path,
         seriesId: episodeFile.seriesId,
@@ -690,7 +802,7 @@ class SonarrMonitor extends ArrClient {
       const response = await this.axios.post(`/api/${this.apiVersion}/command`, command);
       return response.data;
     } catch (error) {
-      log(this.name, `Error registering episode file: ${error.message}`);
+      log(this.name, `Error registering episode file via API: ${error.message}`);
       return null;
     }
   }
@@ -776,9 +888,10 @@ class SonarrMonitor extends ArrClient {
         const episodeFile = {
           path: fullPath,
           seriesId: series.id,
+          seasonNumber: episodeInfo.season,
           quality: { quality: { id: 1, name: 'Unknown' } },
           releaseGroup: '',
-          sceneName: jobName
+          sceneName: videoFile
         };
 
         const registered = await this.registerEpisodeFile(episodeFile, [episode.id]);
