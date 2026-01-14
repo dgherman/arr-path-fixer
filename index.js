@@ -9,8 +9,7 @@ const Database = require('better-sqlite3');
 const CONFIG = {
   nzbdav: {
     url: process.env.NZBDAV_URL,
-    apiKey: process.env.NZBDAV_API_KEY,
-    historyLimit: parseInt(process.env.NZBDAV_HISTORY_LIMIT || '50')
+    apiKey: process.env.NZBDAV_API_KEY
   },
   radarr: {
     enabled: process.env.RADARR_ENABLED === 'true',
@@ -335,14 +334,12 @@ class ArrClient {
   }
 }
 
-// NzbDAV history fetcher
+// NzbDAV history fetcher - fetches all completed downloads
 async function fetchNzbdavHistory() {
   try {
     const params = {
       mode: 'history',
       apikey: CONFIG.nzbdav.apiKey,
-      start: '0',
-      limit: String(CONFIG.nzbdav.historyLimit),
       output: 'json'
     };
 

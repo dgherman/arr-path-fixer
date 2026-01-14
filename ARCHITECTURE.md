@@ -39,7 +39,8 @@ This document describes the integration between NzbDAV, *arr apps (Radarr/Sonarr
 ### arr-path-fixer
 - **Purpose**: Bridges NzbDAV downloads with *arr apps
 - **Container**: Runs with `--network=host` and `--userns=keep-id`
-- **Polling**: Checks NzbDAV history every 5 minutes (configurable)
+- **Polling**: Scans entire NzbDAV history each poll (continuous health check)
+- **Default interval**: 15 minutes (configurable)
 
 ## Configuration (.env)
 
@@ -47,10 +48,9 @@ This document describes the integration between NzbDAV, *arr apps (Radarr/Sonarr
 # NzbDAV Configuration
 NZBDAV_URL=http://localhost:3000
 NZBDAV_API_KEY=<your-key>
-NZBDAV_HISTORY_LIMIT=20
 
 # Polling Configuration
-POLL_INTERVAL_SECONDS=300        # How often to check NzbDAV (5 min)
+POLL_INTERVAL_SECONDS=900        # How often to scan all history (15 min)
 SEARCH_COOLDOWN_MINUTES=30       # Wait before re-searching same item
 
 # Radarr (Movies)
@@ -141,6 +141,13 @@ arr-path-fixer checks for `(2)`, `(3)`, etc. and uses the highest numbered versi
 - Tracks recently searched items in memory
 - Prevents re-searching same item within cooldown period
 - Configurable via `SEARCH_COOLDOWN_MINUTES`
+
+### Full History Scanning
+- Each poll scans **all** completed downloads in NzbDAV history
+- Acts as continuous health check for entire library
+- Detects files that disappear at any time (corruption, deletion, etc.)
+- Most items skip quickly (already registered or wrong category)
+- 15-minute interval is sufficient since full scan catches everything
 
 ### Sonarr Database Integration
 - Direct SQLite insertion bypasses read-only filesystem limitation
