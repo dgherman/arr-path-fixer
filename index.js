@@ -32,6 +32,7 @@ const CONFIG = {
     mountPath: process.env.LIDARR_MOUNT_PATH || '/mnt/nzbdav/content/music'
   },
   pollInterval: parseInt(process.env.POLL_INTERVAL_SECONDS || '60') * 1000,
+  searchCooldownMs: parseInt(process.env.SEARCH_COOLDOWN_MINUTES || '1440') * 60 * 1000, // Default 24 hours
   dryRun: process.env.DRY_RUN === 'true'
 };
 
@@ -323,7 +324,7 @@ class RadarrMonitor extends ArrClient {
     super(name, config, apiVersion);
     // Track recently searched movies to avoid repeated searches
     this.recentlySearched = new Map(); // movieId -> timestamp
-    this.searchCooldownMs = 24 * 60 * 60 * 1000; // 24 hours
+    this.searchCooldownMs = CONFIG.searchCooldownMs;
   }
 
   async getAllMovies() {
@@ -435,7 +436,7 @@ class SonarrMonitor extends ArrClient {
     super(name, config, apiVersion);
     // Track recently searched episodes to avoid repeated searches
     this.recentlySearched = new Map(); // "seriesId-season-episode" -> timestamp
-    this.searchCooldownMs = 24 * 60 * 60 * 1000; // 24 hours
+    this.searchCooldownMs = CONFIG.searchCooldownMs;
   }
 
   async triggerSearchForIncompleteDownload(series, episode, originalRelease) {
@@ -911,7 +912,7 @@ class LidarrMonitor extends ArrClient {
     super(name, config, apiVersion);
     // Track recently searched artists to avoid repeated searches
     this.recentlySearched = new Map(); // artistId -> timestamp
-    this.searchCooldownMs = 24 * 60 * 60 * 1000; // 24 hours
+    this.searchCooldownMs = CONFIG.searchCooldownMs;
   }
 
   async triggerSearchForIncompleteDownload(artist, originalRelease) {
@@ -1036,6 +1037,7 @@ async function monitorAll() {
   log('Main', `Starting monitors: ${monitors.map(m => m.name).join(', ')}`);
   log('Main', `NzbDAV URL: ${CONFIG.nzbdav.url}`);
   log('Main', `Poll interval: ${CONFIG.pollInterval / 1000}s`);
+  log('Main', `Search cooldown: ${CONFIG.searchCooldownMs / 60000} minutes`);
   log('Main', `Dry run: ${CONFIG.dryRun}`);
 
   async function poll() {
