@@ -475,6 +475,28 @@ class SonarrMonitor extends ArrClient {
     }
   }
 
+  parseSeasonInfo(jobName) {
+    // Detect season-only patterns (season packs without episode numbers)
+    const patterns = [
+      /[Ss](\d+)(?![Ee]\d)/,           // S01 not followed by E##
+      /[Ss]eason[.\s_-]?(\d+)/i,       // Season 1, Season.1, Season_1
+      /[._-]S(\d+)[._-]/,              // .S01. or _S01_ or -S01-
+    ];
+
+    for (const pattern of patterns) {
+      const match = jobName.match(pattern);
+      if (match) {
+        const season = parseInt(match[1]);
+        // Verify this isn't actually an episode pattern we missed
+        if (!/[Ss]\d+[Ee]\d+/.test(jobName)) {
+          return { season };
+        }
+      }
+    }
+
+    return null;
+  }
+
   parseEpisodeInfo(jobName) {
     // Try to extract season and episode numbers from release name
     // Supports formats: S01E02, S01E02E03, 1x02, etc.
@@ -506,6 +528,145 @@ class SonarrMonitor extends ArrClient {
     } catch (error) {
       log(this.name, `Error fetching episodes: ${error.message}`);
       return null;
+    }
+  }
+
+  async getAllEpisodes(seriesId) {
+    try {
+      const response = await this.axios.get(`/api/${this.apiVersion}/episode`, {
+        params: { seriesId }
+      });
+      return response.data || [];
+    } catch (error) {
+      log(this.name, `Error fetching episodes: ${error.message}`);
+      return [];
+    }
+  }
+
+  async triggerSeasonSearch(series, seasonNumber) {
+    const searchKey = `${series.id}-season-${seasonNumber}`;
+    const lastSearch = this.recentlySearched.get(searchKey);
+
+    if (lastSearch && (Date.now() - lastSearch) < this.searchCooldownMs) {
+      const hoursAgo = ((Date.now() - lastSearch) / (60 * 60 * 1000)).toFixed(1);
+      log(this.name, `Skipping search for "${series.title}" Season ${seasonNumber} - already searched ${hoursAgo}h ago`);
+      return;
+    }
+
+    log(this.name, `Triggering search for incomplete season pack: "${series.title}" Season ${seasonNumber}`);
+
+    if (!CONFIG.dryRun) {
+      const success = await this.triggerCommand({
+        name: 'SeasonSearch',
+        seriesId: series.id,
+        seasonNumber: seasonNumber
+      });
+
+      if (success) {
+        this.recentlySearched.set(searchKey, Date.now());
+        log(this.name, `✅ Season search triggered for: ${series.title} Season ${seasonNumber}`);
+      } else {
+        log(this.name, `❌ Failed to trigger season search for: ${series.title} Season ${seasonNumber}`);
+      }
+    } else {
+      log(this.name, `[DRY RUN] Would trigger season search for: ${series.title} Season ${seasonNumber}`);
+    }
+  }
+
+  async processSeasonPack(series, seasonNumber, downloadPath, jobName) {
+    log(this.name, `Processing season pack: ${series.title} Season ${seasonNumber}`);
+
+    // Get all episodes for this series
+    const allEpisodes = await this.getAllEpisodes(series.id);
+    const seasonEpisodes = allEpisodes.filter(e => e.seasonNumber === seasonNumber);
+
+    if (seasonEpisodes.length === 0) {
+      log(this.name, `No episodes found in Sonarr for ${series.title} Season ${seasonNumber}`);
+      return;
+    }
+
+    // Check if directory exists and has files
+    let videoFiles = [];
+    try {
+      if (fs.existsSync(downloadPath)) {
+        const files = fs.readdirSync(downloadPath);
+        videoFiles = files.filter(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+      }
+    } catch (error) {
+      log(this.name, `Error scanning directory ${downloadPath}: ${error.message}`);
+    }
+
+    if (videoFiles.length === 0) {
+      log(this.name, `No video files found in season pack directory - download appears incomplete`);
+      await this.triggerSeasonSearch(series, seasonNumber);
+      return;
+    }
+
+    log(this.name, `Found ${videoFiles.length} video files in season pack`);
+
+    // Match video files to episodes
+    let registeredCount = 0;
+    let alreadyHaveCount = 0;
+
+    for (const videoFile of videoFiles) {
+      // Parse episode info from the video filename
+      const fileEpisodeInfo = this.parseEpisodeInfo(videoFile);
+      if (!fileEpisodeInfo) {
+        log(this.name, `Could not parse episode info from file: ${videoFile}`);
+        continue;
+      }
+
+      // Find matching episode in Sonarr
+      const episode = seasonEpisodes.find(
+        e => e.seasonNumber === fileEpisodeInfo.season && e.episodeNumber === fileEpisodeInfo.episode
+      );
+
+      if (!episode) {
+        log(this.name, `No Sonarr episode found for S${fileEpisodeInfo.season}E${fileEpisodeInfo.episode}`);
+        continue;
+      }
+
+      if (episode.hasFile) {
+        alreadyHaveCount++;
+        continue;
+      }
+
+      const fullPath = path.join(downloadPath, videoFile);
+      log(this.name, `Registering ${series.title} S${fileEpisodeInfo.season}E${fileEpisodeInfo.episode}: ${videoFile}`);
+
+      if (!CONFIG.dryRun) {
+        const episodeFile = {
+          path: fullPath,
+          seriesId: series.id,
+          quality: { quality: { id: 1, name: 'Unknown' } },
+          releaseGroup: '',
+          sceneName: jobName
+        };
+
+        const registered = await this.registerEpisodeFile(episodeFile, [episode.id]);
+        if (registered) {
+          registeredCount++;
+        }
+      } else {
+        log(this.name, `[DRY RUN] Would register: ${fullPath}`);
+        registeredCount++;
+      }
+    }
+
+    if (registeredCount > 0) {
+      log(this.name, `✅ Registered ${registeredCount} episodes for ${series.title} Season ${seasonNumber}`);
+    }
+    if (alreadyHaveCount > 0) {
+      log(this.name, `ℹ️  ${alreadyHaveCount} episodes already had files`);
+    }
+
+    // Check if any episodes are still missing files after processing
+    const missingEpisodes = seasonEpisodes.filter(e => !e.hasFile && e.monitored);
+    const processedFiles = videoFiles.filter(f => this.parseEpisodeInfo(f) !== null);
+
+    if (missingEpisodes.length > processedFiles.length) {
+      log(this.name, `Season pack incomplete: ${missingEpisodes.length} episodes expected, ${processedFiles.length} files found`);
+      // Don't trigger search here - the files might just need to be imported first
     }
   }
 
@@ -544,10 +705,12 @@ class SonarrMonitor extends ArrClient {
       // Only process TV category
       if (!category.includes('tv') && !category.includes('sonarr')) continue;
 
-      // Parse episode information
+      // Try to parse episode information (individual episode or season pack)
       const episodeInfo = this.parseEpisodeInfo(jobName);
-      if (!episodeInfo) {
-        log(this.name, `Could not parse episode info from: ${jobName}`);
+      const seasonInfo = !episodeInfo ? this.parseSeasonInfo(jobName) : null;
+
+      if (!episodeInfo && !seasonInfo) {
+        log(this.name, `Could not parse episode/season info from: ${jobName}`);
         continue;
       }
 
@@ -567,7 +730,15 @@ class SonarrMonitor extends ArrClient {
 
       log(this.name, `Matched "${jobName}" to "${series.title}" (score: ${score.toFixed(2)})`);
 
-      // Get the specific episode
+      const downloadPath = path.join(this.config.mountPath, jobName);
+
+      // Handle season packs differently from individual episodes
+      if (seasonInfo) {
+        await this.processSeasonPack(series, seasonInfo.season, downloadPath, jobName);
+        continue;
+      }
+
+      // Individual episode handling (existing logic)
       const episode = await this.getEpisode(series.id, episodeInfo.season, episodeInfo.episode);
       if (!episode) {
         log(this.name, `Episode S${episodeInfo.season}E${episodeInfo.episode} not found for ${series.title}`);
@@ -576,12 +747,10 @@ class SonarrMonitor extends ArrClient {
 
       // Check if episode already has a file
       if (episode.hasFile) {
-        log(this.name, `${series.title} S${episodeInfo.season}E${episodeInfo.episode} already has file`);
         continue;
       }
 
       // Find the actual video file in the download directory
-      const downloadPath = path.join(this.config.mountPath, jobName);
       let videoFile = null;
 
       try {
