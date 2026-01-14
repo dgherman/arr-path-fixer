@@ -317,6 +317,13 @@ async function fetchNzbdavHistory() {
 
 // Radarr-specific handler
 class RadarrMonitor extends ArrClient {
+  constructor(name, config, apiVersion = 'v3') {
+    super(name, config, apiVersion);
+    // Track recently searched movies to avoid repeated searches
+    this.recentlySearched = new Map(); // movieId -> timestamp
+    this.searchCooldownMs = 24 * 60 * 60 * 1000; // 24 hours
+  }
+
   async getAllMovies() {
     try {
       const response = await this.axios.get(`/api/${this.apiVersion}/movie`);
@@ -324,6 +331,34 @@ class RadarrMonitor extends ArrClient {
     } catch (error) {
       log(this.name, `Error fetching movies: ${error.message}`);
       return [];
+    }
+  }
+
+  async triggerSearchForIncompleteDownload(movie, originalRelease) {
+    // Check cooldown to avoid repeated searches
+    const lastSearch = this.recentlySearched.get(movie.id);
+    if (lastSearch && (Date.now() - lastSearch) < this.searchCooldownMs) {
+      const hoursAgo = ((Date.now() - lastSearch) / (60 * 60 * 1000)).toFixed(1);
+      log(this.name, `Skipping search for "${movie.title}" - already searched ${hoursAgo}h ago`);
+      return;
+    }
+
+    log(this.name, `Triggering search for incomplete download: "${movie.title}" (was: ${originalRelease})`);
+
+    if (!CONFIG.dryRun) {
+      const success = await this.triggerCommand({
+        name: 'MoviesSearch',
+        movieIds: [movie.id]
+      });
+
+      if (success) {
+        this.recentlySearched.set(movie.id, Date.now());
+        log(this.name, `✅ Search triggered for: ${movie.title}`);
+      } else {
+        log(this.name, `❌ Failed to trigger search for: ${movie.title}`);
+      }
+    } else {
+      log(this.name, `[DRY RUN] Would trigger search for: ${movie.title}`);
     }
   }
 
@@ -362,7 +397,13 @@ class RadarrMonitor extends ArrClient {
       }
 
       const actualPath = this.findActualPath(jobName, this.config.mountPath);
-      if (!actualPath) continue;
+
+      // If no media files found on disk, the download likely failed - trigger a new search
+      if (!actualPath) {
+        log(this.name, `No media files found for "${movie.title}" - download appears incomplete`);
+        await this.triggerSearchForIncompleteDownload(movie, jobName);
+        continue;
+      }
 
       if (actualPath === movie.path) {
         log(this.name, `Path already correct: ${movie.title}`);
@@ -388,6 +429,42 @@ class RadarrMonitor extends ArrClient {
 
 // Sonarr-specific handler
 class SonarrMonitor extends ArrClient {
+  constructor(name, config, apiVersion = 'v3') {
+    super(name, config, apiVersion);
+    // Track recently searched episodes to avoid repeated searches
+    this.recentlySearched = new Map(); // "seriesId-season-episode" -> timestamp
+    this.searchCooldownMs = 24 * 60 * 60 * 1000; // 24 hours
+  }
+
+  async triggerSearchForIncompleteDownload(series, episode, originalRelease) {
+    const searchKey = `${series.id}-${episode.seasonNumber}-${episode.episodeNumber}`;
+    const lastSearch = this.recentlySearched.get(searchKey);
+
+    if (lastSearch && (Date.now() - lastSearch) < this.searchCooldownMs) {
+      const hoursAgo = ((Date.now() - lastSearch) / (60 * 60 * 1000)).toFixed(1);
+      log(this.name, `Skipping search for "${series.title}" S${episode.seasonNumber}E${episode.episodeNumber} - already searched ${hoursAgo}h ago`);
+      return;
+    }
+
+    log(this.name, `Triggering search for incomplete download: "${series.title}" S${episode.seasonNumber}E${episode.episodeNumber} (was: ${originalRelease})`);
+
+    if (!CONFIG.dryRun) {
+      const success = await this.triggerCommand({
+        name: 'EpisodeSearch',
+        episodeIds: [episode.id]
+      });
+
+      if (success) {
+        this.recentlySearched.set(searchKey, Date.now());
+        log(this.name, `✅ Search triggered for: ${series.title} S${episode.seasonNumber}E${episode.episodeNumber}`);
+      } else {
+        log(this.name, `❌ Failed to trigger search for: ${series.title} S${episode.seasonNumber}E${episode.episodeNumber}`);
+      }
+    } else {
+      log(this.name, `[DRY RUN] Would trigger search for: ${series.title} S${episode.seasonNumber}E${episode.episodeNumber}`);
+    }
+  }
+
   async getAllSeries() {
     try {
       const response = await this.axios.get(`/api/${this.apiVersion}/series`);
@@ -518,7 +595,8 @@ class SonarrMonitor extends ArrClient {
       }
 
       if (!videoFile) {
-        log(this.name, `No video file found in ${downloadPath}`);
+        log(this.name, `No video file found in ${downloadPath} - download appears incomplete`);
+        await this.triggerSearchForIncompleteDownload(series, episode, jobName);
         continue;
       }
 
@@ -547,6 +625,41 @@ class SonarrMonitor extends ArrClient {
 
 // Lidarr-specific handler
 class LidarrMonitor extends ArrClient {
+  constructor(name, config, apiVersion = 'v1') {
+    super(name, config, apiVersion);
+    // Track recently searched artists to avoid repeated searches
+    this.recentlySearched = new Map(); // artistId -> timestamp
+    this.searchCooldownMs = 24 * 60 * 60 * 1000; // 24 hours
+  }
+
+  async triggerSearchForIncompleteDownload(artist, originalRelease) {
+    const lastSearch = this.recentlySearched.get(artist.id);
+
+    if (lastSearch && (Date.now() - lastSearch) < this.searchCooldownMs) {
+      const hoursAgo = ((Date.now() - lastSearch) / (60 * 60 * 1000)).toFixed(1);
+      log(this.name, `Skipping search for "${artist.artistName}" - already searched ${hoursAgo}h ago`);
+      return;
+    }
+
+    log(this.name, `Triggering search for incomplete download: "${artist.artistName}" (was: ${originalRelease})`);
+
+    if (!CONFIG.dryRun) {
+      const success = await this.triggerCommand({
+        name: 'ArtistSearch',
+        artistId: artist.id
+      });
+
+      if (success) {
+        this.recentlySearched.set(artist.id, Date.now());
+        log(this.name, `✅ Search triggered for: ${artist.artistName}`);
+      } else {
+        log(this.name, `❌ Failed to trigger search for: ${artist.artistName}`);
+      }
+    } else {
+      log(this.name, `[DRY RUN] Would trigger search for: ${artist.artistName}`);
+    }
+  }
+
   async getAllArtists() {
     try {
       const response = await this.axios.get(`/api/${this.apiVersion}/artist`);
@@ -584,7 +697,13 @@ class LidarrMonitor extends ArrClient {
       log(this.name, `Matched "${jobName}" to "${artist.artistName}" (score: ${score.toFixed(2)})`);
 
       const actualPath = this.findActualPath(jobName, this.config.mountPath);
-      if (!actualPath) continue;
+
+      // If no media files found on disk, the download likely failed - trigger a new search
+      if (!actualPath) {
+        log(this.name, `No media files found for "${artist.artistName}" - download appears incomplete`);
+        await this.triggerSearchForIncompleteDownload(artist, jobName);
+        continue;
+      }
 
       if (actualPath === artist.path) {
         log(this.name, `Path already correct: ${artist.artistName}`);
