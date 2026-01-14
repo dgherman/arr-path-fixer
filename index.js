@@ -216,6 +216,11 @@ class ArrClient {
             log(this.name, `Found exact match: ${fullPath}`);
             return fullPath;
           }
+          // Exact match exists but no media files - check for numbered versions
+          const numberedPath = this.findNumberedVersion(fullPath, dir);
+          if (numberedPath) {
+            return numberedPath;
+          }
         }
       }
 
@@ -266,6 +271,43 @@ class ArrClient {
       return files.some(f => /\.(mkv|mp4|avi|mov|flac|mp3|m4a)$/i.test(f));
     } catch {
       return false;
+    }
+  }
+
+  // Find directory with numbered suffix (e.g., "Release (2)", "Release (3)") that has media files
+  findNumberedVersion(basePath, baseName) {
+    try {
+      const parentDir = path.dirname(basePath);
+      if (!fs.existsSync(parentDir)) return null;
+
+      const directories = fs.readdirSync(parentDir, { withFileTypes: true })
+        .filter(dirent => dirent.isDirectory())
+        .map(dirent => dirent.name);
+
+      // Look for numbered versions: "baseName (2)", "baseName (3)", etc.
+      const numberedPattern = new RegExp(`^${baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\((\\d+)\\)$`);
+
+      const numberedVersions = directories
+        .filter(dir => numberedPattern.test(dir))
+        .map(dir => ({
+          name: dir,
+          number: parseInt(dir.match(numberedPattern)[1])
+        }))
+        .sort((a, b) => b.number - a.number); // Sort descending (newest first)
+
+      // Return the first numbered version that has media files
+      for (const version of numberedVersions) {
+        const fullPath = path.join(parentDir, version.name);
+        if (this.hasMediaFiles(fullPath)) {
+          log(this.name, `Found numbered version with media: ${fullPath}`);
+          return fullPath;
+        }
+      }
+
+      return null;
+    } catch (error) {
+      log(this.name, `Error finding numbered version: ${error.message}`);
+      return null;
     }
   }
 
@@ -590,10 +632,21 @@ class SonarrMonitor extends ArrClient {
 
     // Check if directory exists and has files
     let videoFiles = [];
+    let actualDownloadPath = downloadPath;
     try {
       if (fs.existsSync(downloadPath)) {
         const files = fs.readdirSync(downloadPath);
         videoFiles = files.filter(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+      }
+
+      // If no video files in original path, check for numbered versions (2), (3), etc.
+      if (videoFiles.length === 0) {
+        const numberedPath = this.findNumberedVersion(downloadPath, jobName);
+        if (numberedPath) {
+          actualDownloadPath = numberedPath;
+          const files = fs.readdirSync(numberedPath);
+          videoFiles = files.filter(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+        }
       }
     } catch (error) {
       log(this.name, `Error scanning directory ${downloadPath}: ${error.message}`);
@@ -605,7 +658,7 @@ class SonarrMonitor extends ArrClient {
       return;
     }
 
-    log(this.name, `Found ${videoFiles.length} video files in season pack`);
+    log(this.name, `Found ${videoFiles.length} video files in season pack (${actualDownloadPath})`);
 
     // Match video files to episodes
     let registeredCount = 0;
@@ -634,7 +687,7 @@ class SonarrMonitor extends ArrClient {
         continue;
       }
 
-      const fullPath = path.join(downloadPath, videoFile);
+      const fullPath = path.join(actualDownloadPath, videoFile);
       log(this.name, `Registering ${series.title} S${fileEpisodeInfo.season}E${fileEpisodeInfo.episode}: ${videoFile}`);
 
       if (!CONFIG.dryRun) {
@@ -865,11 +918,22 @@ class SonarrMonitor extends ArrClient {
 
       // Find the actual video file in the download directory
       let videoFile = null;
+      let actualDownloadPath = downloadPath;
 
       try {
         if (fs.existsSync(downloadPath)) {
           const files = fs.readdirSync(downloadPath);
           videoFile = files.find(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+        }
+
+        // If no video in original path, check for numbered versions (2), (3), etc.
+        if (!videoFile) {
+          const numberedPath = this.findNumberedVersion(downloadPath, jobName);
+          if (numberedPath) {
+            actualDownloadPath = numberedPath;
+            const files = fs.readdirSync(numberedPath);
+            videoFile = files.find(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+          }
         }
       } catch (error) {
         log(this.name, `Error scanning directory ${downloadPath}: ${error.message}`);
@@ -882,7 +946,7 @@ class SonarrMonitor extends ArrClient {
         continue;
       }
 
-      const fullPath = path.join(downloadPath, videoFile);
+      const fullPath = path.join(actualDownloadPath, videoFile);
       log(this.name, `Registering ${series.title} S${episodeInfo.season}E${episodeInfo.episode}: ${fullPath}`);
 
       if (!CONFIG.dryRun) {
