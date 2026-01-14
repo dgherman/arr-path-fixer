@@ -38,6 +38,98 @@ const log = (service, message) => {
   console.log(`[${timestamp}] [${service}] ${message}`);
 };
 
+// Common release groups to remove from matching
+const RELEASE_GROUPS = [
+  'lama', 'yify', 'rarbg', 'ettv', 'eztv', 'sparks', 'geckos', 'fleet',
+  'ntb', 'ctrlhd', 'epsilon', 'fgt', 'ion10', 'memento', 'playbd', 'framestor',
+  'triton', 'unknown', 'flux', 'smurf', 'stringerbell', 'kontrast', 'psa',
+  'turg', 'aaa', 'welp', 'taxes', 'entitled', 'gp', 'privatehd'
+];
+
+// Extract year from a string (returns null if not found)
+function extractYear(str) {
+  const match = str.match(/\b(19|20)\d{2}\b/);
+  return match ? parseInt(match[0]) : null;
+}
+
+// Extract title words for matching (removes noise, keeps meaningful words)
+function extractTitleWords(str) {
+  return str
+    .toLowerCase()
+    // Remove years
+    .replace(/\b(19|20)\d{2}\b/g, ' ')
+    // Remove resolutions
+    .replace(/\b(480|720|1080|2160)[pi]?\b/gi, ' ')
+    // Remove video codecs
+    .replace(/\b(bluray|blu-ray|webrip|web-rip|webdl|web-dl|hdtv|brrip|dvdrip|remux|avc|hevc|x264|x265|h264|h265|vc-?1|10bit)\b/gi, ' ')
+    // Remove audio codecs
+    .replace(/\b(dts|dts-hd|ac3|aac|flac|mp3|m4a|truehd|atmos|ma|5\.1|7\.1|2\.0)\b/gi, ' ')
+    // Remove common tags
+    .replace(/\b(repack|proper|extended|unrated|directors\.?cut|theatrical|imax|3d|hdr|hdr10|dolby\.?vision|dv)\b/gi, ' ')
+    // Remove release groups
+    .replace(new RegExp(`\\b(${RELEASE_GROUPS.join('|')})\\b`, 'gi'), ' ')
+    // Remove episode/season markers for movies
+    .replace(/\bs\d+e\d+\b/gi, ' ')
+    // Replace separators with spaces
+    .replace(/[._-]+/g, ' ')
+    // Remove non-alphanumeric (keep spaces)
+    .replace(/[^a-z0-9\s]/g, ' ')
+    // Collapse whitespace and split
+    .split(/\s+/)
+    .filter(word => word.length > 1); // Remove single chars
+}
+
+// Calculate match score between two sets of words (0-1)
+function calculateMatchScore(words1, words2) {
+  if (words1.length === 0 || words2.length === 0) return 0;
+
+  const set1 = new Set(words1);
+  const set2 = new Set(words2);
+
+  // Count matching words
+  let matches = 0;
+  for (const word of set1) {
+    if (set2.has(word)) matches++;
+  }
+
+  // Score is based on how many of the smaller set's words are found in the larger
+  const minSize = Math.min(set1.size, set2.size);
+  return matches / minSize;
+}
+
+// Find best matching item from a list using word-based matching
+function findBestMatch(targetTitle, targetYear, items, getTitleFn, getYearFn = null) {
+  const targetWords = extractTitleWords(targetTitle);
+
+  let bestMatch = null;
+  let bestScore = 0;
+  const MIN_SCORE = 0.6; // Minimum 60% word overlap required
+
+  for (const item of items) {
+    const itemTitle = getTitleFn(item);
+    const itemWords = extractTitleWords(itemTitle);
+    const itemYear = getYearFn ? getYearFn(item) : extractYear(itemTitle);
+
+    let score = calculateMatchScore(targetWords, itemWords);
+
+    // Boost score if years match
+    if (targetYear && itemYear && targetYear === itemYear) {
+      score += 0.2;
+    }
+    // Penalize if years exist but don't match
+    else if (targetYear && itemYear && Math.abs(targetYear - itemYear) > 1) {
+      score -= 0.3;
+    }
+
+    if (score > bestScore && score >= MIN_SCORE) {
+      bestScore = score;
+      bestMatch = item;
+    }
+  }
+
+  return { match: bestMatch, score: bestScore };
+}
+
 // Generic API client for *arr services
 class ArrClient {
   constructor(name, config, apiVersion = 'v3') {
@@ -100,7 +192,7 @@ class ArrClient {
     }
   }
 
-  findActualPath(expectedTitle, mountPath) {
+  findActualPath(releaseName, mountPath) {
     try {
       if (!fs.existsSync(mountPath)) {
         log(this.name, `Mount path doesn't exist: ${mountPath}`);
@@ -111,32 +203,66 @@ class ArrClient {
         .filter(dirent => dirent.isDirectory())
         .map(dirent => dirent.name);
 
-      // Try to find directory that contains the title (case-insensitive)
-      const titleLower = expectedTitle.toLowerCase().replace(/[^a-z0-9]/g, '');
-
+      // First try exact match (release name matches directory name)
+      const releaseNormalized = releaseName.toLowerCase().replace(/[^a-z0-9]/g, '');
       for (const dir of directories) {
-        const dirLower = dir.toLowerCase().replace(/[^a-z0-9]/g, '');
-        if (dirLower.includes(titleLower) || titleLower.includes(dirLower)) {
+        const dirNormalized = dir.toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (dirNormalized === releaseNormalized) {
           const fullPath = path.join(mountPath, dir);
-
-          // Verify it has media files
-          const files = fs.readdirSync(fullPath);
-          const hasMedia = files.some(f =>
-            /\.(mkv|mp4|avi|mov|flac|mp3|m4a)$/i.test(f)
-          );
-
-          if (hasMedia) {
-            log(this.name, `Found actual path: ${fullPath}`);
+          if (this.hasMediaFiles(fullPath)) {
+            log(this.name, `Found exact match: ${fullPath}`);
             return fullPath;
           }
         }
       }
 
-      log(this.name, `No matching directory found for: ${expectedTitle}`);
+      // Fall back to word-based matching
+      const releaseWords = extractTitleWords(releaseName);
+      const releaseYear = extractYear(releaseName);
+
+      let bestMatch = null;
+      let bestScore = 0;
+      const MIN_SCORE = 0.7; // Higher threshold for directory matching
+
+      for (const dir of directories) {
+        const dirWords = extractTitleWords(dir);
+        const dirYear = extractYear(dir);
+
+        let score = calculateMatchScore(releaseWords, dirWords);
+
+        // Boost score if years match
+        if (releaseYear && dirYear && releaseYear === dirYear) {
+          score += 0.2;
+        }
+
+        if (score > bestScore && score >= MIN_SCORE) {
+          const fullPath = path.join(mountPath, dir);
+          if (this.hasMediaFiles(fullPath)) {
+            bestScore = score;
+            bestMatch = fullPath;
+          }
+        }
+      }
+
+      if (bestMatch) {
+        log(this.name, `Found matching path (score: ${bestScore.toFixed(2)}): ${bestMatch}`);
+        return bestMatch;
+      }
+
+      log(this.name, `No matching directory found for: ${releaseName}`);
       return null;
     } catch (error) {
       log(this.name, `Error finding actual path: ${error.message}`);
       return null;
+    }
+  }
+
+  hasMediaFiles(dirPath) {
+    try {
+      const files = fs.readdirSync(dirPath);
+      return files.some(f => /\.(mkv|mp4|avi|mov|flac|mp3|m4a)$/i.test(f));
+    } catch {
+      return false;
     }
   }
 
@@ -211,25 +337,31 @@ class RadarrMonitor extends ArrClient {
       // Only process movies category
       if (!category.includes('movie')) continue;
 
-      const normalizedJob = this.normalizeTitle(jobName);
+      // Extract year from release name for better matching
+      const releaseYear = extractYear(jobName);
 
-      // Find matching movie
-      const movie = movies.find(m => {
-        const normalizedTitle = this.normalizeTitle(m.title);
-        return normalizedJob.includes(normalizedTitle) || normalizedTitle.includes(normalizedJob);
-      });
+      // Use improved word-based matching
+      const { match: movie, score } = findBestMatch(
+        jobName,
+        releaseYear,
+        movies,
+        m => m.title,
+        m => m.year
+      );
 
       if (!movie) {
         log(this.name, `No matching movie found for: ${jobName}`);
         continue;
       }
 
+      log(this.name, `Matched "${jobName}" to "${movie.title}" (score: ${score.toFixed(2)})`);
+
       // Skip if already has file
       if (movie.hasFile) {
         continue;
       }
 
-      const actualPath = this.findActualPath(movie.title, this.config.mountPath);
+      const actualPath = this.findActualPath(jobName, this.config.mountPath);
       if (!actualPath) continue;
 
       if (actualPath === movie.path) {
@@ -342,18 +474,21 @@ class SonarrMonitor extends ArrClient {
         continue;
       }
 
-      const normalizedJob = this.normalizeTitle(jobName);
-
-      // Find matching series
-      const series = allSeries.find(s => {
-        const normalizedTitle = this.normalizeTitle(s.title);
-        return normalizedJob.includes(normalizedTitle) || normalizedTitle.includes(normalizedJob);
-      });
+      // Use improved word-based matching
+      const { match: series, score } = findBestMatch(
+        jobName,
+        null, // TV shows don't typically have year in release name
+        allSeries,
+        s => s.title,
+        s => s.year
+      );
 
       if (!series) {
         log(this.name, `No matching series found for: ${jobName}`);
         continue;
       }
+
+      log(this.name, `Matched "${jobName}" to "${series.title}" (score: ${score.toFixed(2)})`);
 
       // Get the specific episode
       const episode = await this.getEpisode(series.id, episodeInfo.season, episodeInfo.episode);
@@ -432,20 +567,23 @@ class LidarrMonitor extends ArrClient {
       // Only process music category
       if (!category.includes('music') && !category.includes('lidarr')) continue;
 
-      const normalizedJob = this.normalizeTitle(jobName);
-
-      // Find matching artist
-      const artist = allArtists.find(a => {
-        const normalizedName = this.normalizeTitle(a.artistName);
-        return normalizedJob.includes(normalizedName) || normalizedName.includes(normalizedJob);
-      });
+      // Use improved word-based matching
+      const { match: artist, score } = findBestMatch(
+        jobName,
+        null,
+        allArtists,
+        a => a.artistName,
+        null
+      );
 
       if (!artist) {
         log(this.name, `No matching artist found for: ${jobName}`);
         continue;
       }
 
-      const actualPath = this.findActualPath(artist.artistName, this.config.mountPath);
+      log(this.name, `Matched "${jobName}" to "${artist.artistName}" (score: ${score.toFixed(2)})`);
+
+      const actualPath = this.findActualPath(jobName, this.config.mountPath);
       if (!actualPath) continue;
 
       if (actualPath === artist.path) {
