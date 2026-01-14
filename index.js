@@ -208,9 +208,11 @@ class ArrClient {
 
       // First try exact match (release name matches directory name)
       const releaseNormalized = releaseName.toLowerCase().replace(/[^a-z0-9]/g, '');
+      let exactMatchFound = false;
       for (const dir of directories) {
         const dirNormalized = dir.toLowerCase().replace(/[^a-z0-9]/g, '');
         if (dirNormalized === releaseNormalized) {
+          exactMatchFound = true;
           const fullPath = path.join(mountPath, dir);
           if (this.hasMediaFiles(fullPath)) {
             log(this.name, `Found exact match: ${fullPath}`);
@@ -221,6 +223,15 @@ class ArrClient {
           if (numberedPath) {
             return numberedPath;
           }
+        }
+      }
+
+      // If no exact match directory exists, check if numbered versions exist directly
+      if (!exactMatchFound) {
+        const basePath = path.join(mountPath, releaseName);
+        const numberedPath = this.findNumberedVersion(basePath, releaseName);
+        if (numberedPath) {
+          return numberedPath;
         }
       }
 
