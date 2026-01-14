@@ -146,11 +146,28 @@ class ArrClient {
 
   async getQueue() {
     try {
-      const response = await this.axios.get(`/api/${this.apiVersion}/queue`);
+      const response = await this.axios.get(`/api/${this.apiVersion}/queue?includeUnknownSeriesItems=true&pageSize=1000`);
       return response.data.records || [];
     } catch (error) {
       log(this.name, `Error fetching queue: ${error.message}`);
       return [];
+    }
+  }
+
+  async clearFailedQueueEntries(filterFn) {
+    try {
+      const queue = await this.getQueue();
+      const failedEntries = queue.filter(item => item.status === 'failed' && filterFn(item));
+
+      for (const entry of failedEntries) {
+        await this.removeFromQueue(entry.id);
+        log(this.name, `Cleared failed queue entry: ${entry.title}`);
+      }
+
+      return failedEntries.length;
+    } catch (error) {
+      log(this.name, `Error clearing failed queue entries: ${error.message}`);
+      return 0;
     }
   }
 
@@ -472,6 +489,8 @@ class RadarrMonitor extends ArrClient {
         if (updated) {
           log(this.name, `Triggering refresh for: ${movie.title}`);
           await this.triggerCommand({ name: 'RefreshMovie', movieIds: [movie.id] });
+          // Clear any failed queue entries for this movie
+          await this.clearFailedQueueEntries(item => item.movieId === movie.id);
         }
       } else {
         log(this.name, `[DRY RUN] Would update path and refresh`);
@@ -711,6 +730,11 @@ class SonarrMonitor extends ArrClient {
         const registered = await this.registerEpisodeFile(episodeFile, [episode.id]);
         if (registered) {
           registeredCount++;
+          // Clear any failed queue entries for this episode
+          await this.clearFailedQueueEntries(item =>
+            item.seriesId === series.id &&
+            item.episodeId === episode.id
+          );
         }
       } else {
         log(this.name, `[DRY RUN] Would register: ${fullPath}`);
@@ -970,6 +994,11 @@ class SonarrMonitor extends ArrClient {
         const registered = await this.registerEpisodeFile(episodeFile, [episode.id]);
         if (registered) {
           log(this.name, `✅ Successfully registered: ${series.title} S${episodeInfo.season}E${episodeInfo.episode}`);
+          // Clear any failed queue entries for this episode
+          await this.clearFailedQueueEntries(item =>
+            item.seriesId === series.id &&
+            item.episodeId === episode.id
+          );
         }
       } else {
         log(this.name, `[DRY RUN] Would register episode file: ${fullPath}`);

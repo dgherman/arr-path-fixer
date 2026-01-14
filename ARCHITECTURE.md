@@ -155,6 +155,12 @@ arr-path-fixer checks for `(2)`, `(3)`, etc. and uses the highest numbered versi
 - Languages stored as: `[1]` (array of language IDs, 1 = English)
 - Automatically updates Series.Path to match mount path
 
+### Failed Queue Cleanup
+- After successfully registering a file, clears failed queue entries
+- Removes the "red cloud" / "download failed" indicators in *arr UI
+- Matches queue entries by seriesId/episodeId (Sonarr) or movieId (Radarr)
+- Sonarr/Radarr don't auto-clear these because arr-path-fixer bypasses their import flow
+
 ## NzbDAV Background Repairs
 
 **Status**: Disabled (recommended)
