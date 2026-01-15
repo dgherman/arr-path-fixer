@@ -1412,7 +1412,22 @@ class LidarrMonitor extends ArrClient {
         log(this.name, `✅ Registered ${registeredCount} tracks for album "${album.title}"`);
         // Clear any failed queue entries for this album
         await this.clearFailedQueueEntries(item => item.albumId === album.id);
+        // Trigger artist refresh to update Lidarr UI immediately
+        await this.refreshArtist(album.artist?.artistMetadataId || album.artistId);
       }
+    }
+  }
+
+  async refreshArtist(artistId) {
+    if (!artistId) return;
+    try {
+      await this.axios.post(`/api/${this.apiVersion}/command`, {
+        name: 'RefreshArtist',
+        artistId: artistId
+      });
+      log(this.name, `Triggered refresh for artist ${artistId}`);
+    } catch (error) {
+      log(this.name, `Failed to trigger artist refresh: ${error.message}`);
     }
   }
 }
