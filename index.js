@@ -1093,19 +1093,38 @@ class LidarrMonitor extends ArrClient {
 
   parseTrackNumber(filename) {
     // Try to extract track number from filename
-    // Patterns: 01-artist-title.flac, 01 title.mp3, track01.flac, etc.
-    const patterns = [
-      /^(\d{1,2})[-_.\s]/,           // 01-..., 01_..., 01 ...
-      /track\s*(\d{1,2})/i,          // track01, track 1
-      /^(\d{1,2})\./,                // 01.title
-    ];
+    // Various patterns used in music releases
 
-    for (const pattern of patterns) {
-      const match = filename.match(pattern);
-      if (match) {
-        return parseInt(match[1]);
-      }
+    // Pattern 1: 3-digit disc+track format (102 = disc 1 track 02, 201 = disc 2 track 01)
+    const discTrackMatch = filename.match(/^(\d)(\d{2})[-_.\s]/);
+    if (discTrackMatch) {
+      return parseInt(discTrackMatch[2]); // Return just the track portion
     }
+
+    // Pattern 2: Standard 1-2 digit track at start (01-..., 01_..., 01 ...)
+    const standardMatch = filename.match(/^(\d{1,2})[-_.\s]/);
+    if (standardMatch) {
+      return parseInt(standardMatch[1]);
+    }
+
+    // Pattern 3: Track number in middle with _-_NN_-_ format (artist_-_08_-_title.mp3)
+    const middleMatch = filename.match(/_-_(\d{1,2})_-_/);
+    if (middleMatch) {
+      return parseInt(middleMatch[1]);
+    }
+
+    // Pattern 4: Track keyword (track01, track 1)
+    const trackMatch = filename.match(/track\s*(\d{1,2})/i);
+    if (trackMatch) {
+      return parseInt(trackMatch[1]);
+    }
+
+    // Pattern 5: Just digits at start followed by dot (01.title)
+    const dotMatch = filename.match(/^(\d{1,2})\./);
+    if (dotMatch) {
+      return parseInt(dotMatch[1]);
+    }
+
     return null;
   }
 
@@ -1239,25 +1258,37 @@ class LidarrMonitor extends ArrClient {
       return { match: null, score: 0 };
     }
 
-    // Step 3: Match against album titles only (not artist+album)
+    // Step 3: Match against album titles
     const jobWords = extractTitleWords(jobName);
+    // Also create a normalized version for short title matching
+    const jobNameNormalized = jobName.toLowerCase().replace(/[^a-z0-9]/g, '');
 
     let bestMatch = null;
     let bestScore = 0;
 
     for (const album of artistAlbums) {
       const albumWords = extractTitleWords(album.title);
+      let score = 0;
 
-      // Calculate how many album title words appear in the job name
-      let matchingWords = 0;
-      for (const word of albumWords) {
-        if (jobWords.includes(word)) {
-          matchingWords++;
+      // For short album titles (1-2 words after extraction, or titles like "L.W.", "K.G.")
+      // Use normalized substring matching instead
+      const albumTitleNormalized = album.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+      if (albumWords.length <= 1 || album.title.length <= 4) {
+        // Short title: check if normalized album title appears in normalized job name
+        if (albumTitleNormalized.length >= 2 && jobNameNormalized.includes(albumTitleNormalized)) {
+          score = 1.0; // Perfect match for short titles
         }
+      } else {
+        // Normal word-based matching for longer titles
+        let matchingWords = 0;
+        for (const word of albumWords) {
+          if (jobWords.includes(word)) {
+            matchingWords++;
+          }
+        }
+        score = albumWords.length > 0 ? matchingWords / albumWords.length : 0;
       }
-
-      // Score based on percentage of album title words found
-      const score = albumWords.length > 0 ? matchingWords / albumWords.length : 0;
 
       if (score > bestScore) {
         bestScore = score;
