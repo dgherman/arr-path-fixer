@@ -1217,6 +1217,61 @@ class LidarrMonitor extends ArrClient {
     }
   }
 
+  findBestAlbumMatch(jobName, allAlbums, allArtists) {
+    // Step 1: Find matching artist first
+    const { match: artist, score: artistScore } = findBestMatch(
+      jobName,
+      null,
+      allArtists,
+      a => a.artistName,
+      null
+    );
+
+    if (!artist || artistScore < 0.5) {
+      return { match: null, score: 0 };
+    }
+
+    // Step 2: Filter albums to this artist only
+    const artistAlbums = allAlbums.filter(a => a.artist?.artistName === artist.artistName);
+
+    if (artistAlbums.length === 0) {
+      return { match: null, score: 0 };
+    }
+
+    // Step 3: Match against album titles only (not artist+album)
+    const jobWords = extractTitleWords(jobName);
+
+    let bestMatch = null;
+    let bestScore = 0;
+
+    for (const album of artistAlbums) {
+      const albumWords = extractTitleWords(album.title);
+
+      // Calculate how many album title words appear in the job name
+      let matchingWords = 0;
+      for (const word of albumWords) {
+        if (jobWords.includes(word)) {
+          matchingWords++;
+        }
+      }
+
+      // Score based on percentage of album title words found
+      const score = albumWords.length > 0 ? matchingWords / albumWords.length : 0;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = album;
+      }
+    }
+
+    // Require at least 50% of album title words to match
+    if (bestScore >= 0.5) {
+      return { match: bestMatch, score: bestScore };
+    }
+
+    return { match: null, score: 0 };
+  }
+
   async processHistory(nzbdavHistory) {
     const allArtists = await this.getAllArtists();
     const allAlbums = await this.getAllAlbums();
@@ -1228,17 +1283,11 @@ class LidarrMonitor extends ArrClient {
       // Only process configured categories
       if (!this.config.categories.some(cat => category.includes(cat))) continue;
 
-      // First try to match to an album (more specific)
-      const { match: album, score: albumScore } = findBestMatch(
-        jobName,
-        null,
-        allAlbums,
-        a => `${a.artist?.artistName || ''} ${a.title}`,
-        a => a.releaseDate ? new Date(a.releaseDate).getFullYear() : null
-      );
+      // Match artist first, then album within that artist
+      const { match: album, score: albumScore } = this.findBestAlbumMatch(jobName, allAlbums, allArtists);
 
-      if (!album || albumScore < 0.5) {
-        // Fall back to artist matching
+      if (!album) {
+        // Fall back to artist-only matching for logging
         const { match: artist, score: artistScore } = findBestMatch(
           jobName,
           null,
