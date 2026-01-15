@@ -1163,8 +1163,9 @@ class LidarrMonitor extends ArrClient {
         qualityName = 'AAC-320';
       }
 
+      // Quality format: quality is just the ID integer, not a nested object
       const qualityJson = JSON.stringify({
-        quality: { id: qualityId, name: qualityName },
+        quality: qualityId,
         revision: { version: 1, real: 0, isRepack: false }
       });
 
