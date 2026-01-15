@@ -58,6 +58,7 @@ RADARR_ENABLED=true
 RADARR_URL=http://localhost:7878
 RADARR_API_KEY=<your-key>
 RADARR_MOUNT_PATH=/mnt/nzbdav/content/movies
+RADARR_CATEGORIES=movies            # NzbDAV categories to process (default: movies)
 
 # Sonarr (TV)
 SONARR_ENABLED=true
@@ -65,12 +66,14 @@ SONARR_URL=http://localhost:8989
 SONARR_API_KEY=<your-key>
 SONARR_MOUNT_PATH=/mnt/nzbdav/content/tv
 SONARR_DB_PATH=/config/sonarr/sonarr.db
+SONARR_CATEGORIES=tv                # NzbDAV categories to process (default: tv)
 
 # Lidarr (Music) - Optional
 LIDARR_ENABLED=false
 LIDARR_URL=http://localhost:8686
 LIDARR_API_KEY=<your-key>
 LIDARR_MOUNT_PATH=/mnt/nzbdav/content/music
+LIDARR_CATEGORIES=music             # NzbDAV categories to process (default: music)
 ```
 
 ## Container Deployment

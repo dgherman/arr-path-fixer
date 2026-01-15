@@ -15,20 +15,23 @@ const CONFIG = {
     enabled: process.env.RADARR_ENABLED === 'true',
     url: process.env.RADARR_URL,
     apiKey: process.env.RADARR_API_KEY,
-    mountPath: process.env.RADARR_MOUNT_PATH || '/mnt/nzbdav/content/movies'
+    mountPath: process.env.RADARR_MOUNT_PATH || '/mnt/nzbdav/content/movies',
+    categories: (process.env.RADARR_CATEGORIES || 'movies').toLowerCase().split(',').map(s => s.trim())
   },
   sonarr: {
     enabled: process.env.SONARR_ENABLED === 'true',
     url: process.env.SONARR_URL,
     apiKey: process.env.SONARR_API_KEY,
     mountPath: process.env.SONARR_MOUNT_PATH || '/mnt/nzbdav/content/tv',
-    dbPath: process.env.SONARR_DB_PATH || '/config/sonarr/sonarr.db'
+    dbPath: process.env.SONARR_DB_PATH || '/config/sonarr/sonarr.db',
+    categories: (process.env.SONARR_CATEGORIES || 'tv').toLowerCase().split(',').map(s => s.trim())
   },
   lidarr: {
     enabled: process.env.LIDARR_ENABLED === 'true',
     url: process.env.LIDARR_URL,
     apiKey: process.env.LIDARR_API_KEY,
-    mountPath: process.env.LIDARR_MOUNT_PATH || '/mnt/nzbdav/content/music'
+    mountPath: process.env.LIDARR_MOUNT_PATH || '/mnt/nzbdav/content/music',
+    categories: (process.env.LIDARR_CATEGORIES || 'music').toLowerCase().split(',').map(s => s.trim())
   },
   pollInterval: parseInt(process.env.POLL_INTERVAL_SECONDS || '60') * 1000,
   searchCooldownMs: parseInt(process.env.SEARCH_COOLDOWN_MINUTES || '1440') * 60 * 1000, // Default 24 hours
@@ -439,8 +442,8 @@ class RadarrMonitor extends ArrClient {
       const jobName = historyItem.job_name || historyItem.name || '';
       const category = (historyItem.category || historyItem.Category || '').toLowerCase();
 
-      // Only process movies category
-      if (!category.includes('movie')) continue;
+      // Only process configured categories
+      if (!this.config.categories.some(cat => category.includes(cat))) continue;
 
       // Extract year from release name for better matching
       const releaseYear = extractYear(jobName);
@@ -900,8 +903,8 @@ class SonarrMonitor extends ArrClient {
       const jobName = historyItem.job_name || historyItem.name || '';
       const category = (historyItem.category || historyItem.Category || '').toLowerCase();
 
-      // Only process TV category
-      if (!category.includes('tv') && !category.includes('sonarr')) continue;
+      // Only process configured categories
+      if (!this.config.categories.some(cat => category.includes(cat))) continue;
 
       // Try to parse episode information (individual episode or season pack)
       const episodeInfo = this.parseEpisodeInfo(jobName);
@@ -1061,8 +1064,8 @@ class LidarrMonitor extends ArrClient {
       const jobName = historyItem.job_name || historyItem.name || '';
       const category = (historyItem.category || historyItem.Category || '').toLowerCase();
 
-      // Only process music category
-      if (!category.includes('music') && !category.includes('lidarr')) continue;
+      // Only process configured categories
+      if (!this.config.categories.some(cat => category.includes(cat))) continue;
 
       // Use improved word-based matching
       const { match: artist, score } = findBestMatch(
