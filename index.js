@@ -31,6 +31,7 @@ const CONFIG = {
     url: process.env.LIDARR_URL,
     apiKey: process.env.LIDARR_API_KEY,
     mountPath: process.env.LIDARR_MOUNT_PATH || '/mnt/nzbdav/content/music',
+    dbPath: process.env.LIDARR_DB_PATH || '/config/lidarr/lidarr.db',
     categories: (process.env.LIDARR_CATEGORIES || 'music').toLowerCase().split(',').map(s => s.trim())
   },
   pollInterval: parseInt(process.env.POLL_INTERVAL_SECONDS || '60') * 1000,
@@ -1014,36 +1015,36 @@ class SonarrMonitor extends ArrClient {
 class LidarrMonitor extends ArrClient {
   constructor(name, config, apiVersion = 'v1') {
     super(name, config, apiVersion);
-    // Track recently searched artists to avoid repeated searches
-    this.recentlySearched = new Map(); // artistId -> timestamp
+    // Track recently searched albums to avoid repeated searches
+    this.recentlySearched = new Map(); // albumId -> timestamp
     this.searchCooldownMs = CONFIG.searchCooldownMs;
   }
 
-  async triggerSearchForIncompleteDownload(artist, originalRelease) {
-    const lastSearch = this.recentlySearched.get(artist.id);
+  async triggerSearchForIncompleteDownload(album, originalRelease) {
+    const lastSearch = this.recentlySearched.get(album.id);
 
     if (lastSearch && (Date.now() - lastSearch) < this.searchCooldownMs) {
       const hoursAgo = ((Date.now() - lastSearch) / (60 * 60 * 1000)).toFixed(1);
-      log(this.name, `Skipping search for "${artist.artistName}" - already searched ${hoursAgo}h ago`);
+      log(this.name, `Skipping search for album "${album.title}" - already searched ${hoursAgo}h ago`);
       return;
     }
 
-    log(this.name, `Triggering search for incomplete download: "${artist.artistName}" (was: ${originalRelease})`);
+    log(this.name, `Triggering search for incomplete download: "${album.title}" (was: ${originalRelease})`);
 
     if (!CONFIG.dryRun) {
       const success = await this.triggerCommand({
-        name: 'ArtistSearch',
-        artistId: artist.id
+        name: 'AlbumSearch',
+        albumIds: [album.id]
       });
 
       if (success) {
-        this.recentlySearched.set(artist.id, Date.now());
-        log(this.name, `✅ Search triggered for: ${artist.artistName}`);
+        this.recentlySearched.set(album.id, Date.now());
+        log(this.name, `✅ Search triggered for album: ${album.title}`);
       } else {
-        log(this.name, `❌ Failed to trigger search for: ${artist.artistName}`);
+        log(this.name, `❌ Failed to trigger search for album: ${album.title}`);
       }
     } else {
-      log(this.name, `[DRY RUN] Would trigger search for: ${artist.artistName}`);
+      log(this.name, `[DRY RUN] Would trigger search for album: ${album.title}`);
     }
   }
 
@@ -1057,8 +1058,168 @@ class LidarrMonitor extends ArrClient {
     }
   }
 
+  async getAllAlbums() {
+    try {
+      const response = await this.axios.get(`/api/${this.apiVersion}/album`);
+      return response.data || [];
+    } catch (error) {
+      log(this.name, `Error fetching albums: ${error.message}`);
+      return [];
+    }
+  }
+
+  async getAlbumTracks(albumId) {
+    try {
+      const response = await this.axios.get(`/api/${this.apiVersion}/track`, {
+        params: { albumId }
+      });
+      return response.data || [];
+    } catch (error) {
+      log(this.name, `Error fetching tracks for album ${albumId}: ${error.message}`);
+      return [];
+    }
+  }
+
+  getDatabase() {
+    if (!this._db) {
+      if (!fs.existsSync(this.config.dbPath)) {
+        log(this.name, `Database not found at: ${this.config.dbPath}`);
+        return null;
+      }
+      this._db = new Database(this.config.dbPath);
+    }
+    return this._db;
+  }
+
+  parseTrackNumber(filename) {
+    // Try to extract track number from filename
+    // Patterns: 01-artist-title.flac, 01 title.mp3, track01.flac, etc.
+    const patterns = [
+      /^(\d{1,2})[-_.\s]/,           // 01-..., 01_..., 01 ...
+      /track\s*(\d{1,2})/i,          // track01, track 1
+      /^(\d{1,2})\./,                // 01.title
+    ];
+
+    for (const pattern of patterns) {
+      const match = filename.match(pattern);
+      if (match) {
+        return parseInt(match[1]);
+      }
+    }
+    return null;
+  }
+
+  async registerTrackFile(trackFilePath, albumId, track) {
+    const db = this.getDatabase();
+    if (!db) {
+      log(this.name, 'Database not available');
+      return null;
+    }
+
+    try {
+      // Get file size
+      let fileSize = 0;
+      try {
+        const stats = fs.statSync(trackFilePath);
+        fileSize = stats.size;
+      } catch (e) {
+        log(this.name, `Could not get file size: ${e.message}`);
+      }
+
+      // Check if track file already exists for this path
+      const existingFile = db.prepare(
+        'SELECT Id FROM TrackFiles WHERE Path = ?'
+      ).get(trackFilePath);
+
+      if (existingFile) {
+        log(this.name, `Track file already registered with ID ${existingFile.Id}`);
+        // Ensure track is linked to this file
+        db.prepare('UPDATE Tracks SET TrackFileId = ? WHERE Id = ?').run(existingFile.Id, track.id);
+        return { id: existingFile.Id };
+      }
+
+      // Extract release group from filename
+      const releaseGroupMatch = trackFilePath.match(/-([A-Za-z0-9]+)\.[^.]+$/);
+      const releaseGroup = releaseGroupMatch ? releaseGroupMatch[1] : '';
+
+      // Detect quality from file extension
+      const ext = path.extname(trackFilePath).toLowerCase();
+      let qualityId = 1; // Unknown
+      let qualityName = 'Unknown';
+      if (ext === '.flac') {
+        // Check if 24bit based on filename
+        if (trackFilePath.toLowerCase().includes('24bit') || trackFilePath.toLowerCase().includes('24-bit')) {
+          qualityId = 21;
+          qualityName = 'FLAC 24bit';
+        } else {
+          qualityId = 6;
+          qualityName = 'FLAC';
+        }
+      } else if (ext === '.mp3') {
+        qualityId = 4;
+        qualityName = 'MP3-320';
+      } else if (ext === '.m4a' || ext === '.aac') {
+        qualityId = 5;
+        qualityName = 'AAC-320';
+      }
+
+      const qualityJson = JSON.stringify({
+        quality: { id: qualityId, name: qualityName },
+        revision: { version: 1, real: 0, isRepack: false }
+      });
+
+      const now = new Date().toISOString();
+
+      // Insert new track file record
+      const result = db.prepare(`
+        INSERT INTO TrackFiles (AlbumId, Quality, Size, SceneName, DateAdded, ReleaseGroup, MediaInfo, Modified, Path, IndexerFlags)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0)
+      `).run(
+        albumId,
+        qualityJson,
+        fileSize,
+        path.basename(trackFilePath),
+        now,
+        releaseGroup,
+        now,
+        trackFilePath
+      );
+
+      const trackFileId = result.lastInsertRowid;
+      log(this.name, `Inserted TrackFile with ID ${trackFileId}`);
+
+      // Link track to the new file
+      db.prepare('UPDATE Tracks SET TrackFileId = ? WHERE Id = ?').run(trackFileId, track.id);
+      log(this.name, `Linked track ${track.id} to file ${trackFileId}`);
+
+      return { id: trackFileId };
+    } catch (error) {
+      log(this.name, `Error registering track file via DB: ${error.message}`);
+      return null;
+    }
+  }
+
+  hasAudioFiles(dirPath) {
+    try {
+      const files = fs.readdirSync(dirPath);
+      return files.some(f => /\.(flac|mp3|m4a|aac|ogg|wav)$/i.test(f));
+    } catch {
+      return false;
+    }
+  }
+
+  getAudioFiles(dirPath) {
+    try {
+      const files = fs.readdirSync(dirPath);
+      return files.filter(f => /\.(flac|mp3|m4a|aac|ogg|wav)$/i.test(f));
+    } catch {
+      return [];
+    }
+  }
+
   async processHistory(nzbdavHistory) {
     const allArtists = await this.getAllArtists();
+    const allAlbums = await this.getAllAlbums();
 
     for (const historyItem of nzbdavHistory) {
       const jobName = historyItem.job_name || historyItem.name || '';
@@ -1067,48 +1228,109 @@ class LidarrMonitor extends ArrClient {
       // Only process configured categories
       if (!this.config.categories.some(cat => category.includes(cat))) continue;
 
-      // Use improved word-based matching
-      const { match: artist, score } = findBestMatch(
+      // First try to match to an album (more specific)
+      const { match: album, score: albumScore } = findBestMatch(
         jobName,
         null,
-        allArtists,
-        a => a.artistName,
-        null
+        allAlbums,
+        a => `${a.artist?.artistName || ''} ${a.title}`,
+        a => a.releaseDate ? new Date(a.releaseDate).getFullYear() : null
       );
 
-      if (!artist) {
-        log(this.name, `No matching artist found for: ${jobName}`);
-        continue;
-      }
+      if (!album || albumScore < 0.5) {
+        // Fall back to artist matching
+        const { match: artist, score: artistScore } = findBestMatch(
+          jobName,
+          null,
+          allArtists,
+          a => a.artistName,
+          null
+        );
 
-      log(this.name, `Matched "${jobName}" to "${artist.artistName}" (score: ${score.toFixed(2)})`);
-
-      const actualPath = this.findActualPath(jobName, this.config.mountPath);
-
-      // If no media files found on disk, the download likely failed - trigger a new search
-      if (!actualPath) {
-        log(this.name, `No media files found for "${artist.artistName}" - download appears incomplete`);
-        await this.triggerSearchForIncompleteDownload(artist, jobName);
-        continue;
-      }
-
-      if (actualPath === artist.path) {
-        log(this.name, `Path already correct: ${artist.artistName}`);
-        continue;
-      }
-
-      log(this.name, `Updating path from ${artist.path} to ${actualPath}`);
-
-      if (!CONFIG.dryRun) {
-        artist.path = actualPath;
-        const updated = await this.updateItem(artist.id, 'artist', artist);
-
-        if (updated) {
-          log(this.name, `Triggering refresh for: ${artist.artistName}`);
-          await this.triggerCommand({ name: 'RefreshArtist', artistId: artist.id });
+        if (!artist) {
+          log(this.name, `No matching artist/album found for: ${jobName}`);
+          continue;
         }
-      } else {
-        log(this.name, `[DRY RUN] Would update path and refresh`);
+
+        log(this.name, `Matched "${jobName}" to artist "${artist.artistName}" (score: ${artistScore.toFixed(2)}) - no specific album match`);
+        continue;
+      }
+
+      log(this.name, `Matched "${jobName}" to album "${album.title}" by "${album.artist?.artistName}" (score: ${albumScore.toFixed(2)})`);
+
+      // Check if album already has all tracks with files
+      const tracks = await this.getAlbumTracks(album.id);
+      const tracksWithoutFiles = tracks.filter(t => !t.hasFile);
+
+      if (tracksWithoutFiles.length === 0) {
+        continue; // All tracks already have files
+      }
+
+      // Find the download directory
+      const downloadPath = path.join(this.config.mountPath, jobName);
+      let actualDownloadPath = downloadPath;
+
+      // Check for actual files
+      if (!fs.existsSync(downloadPath) || !this.hasAudioFiles(downloadPath)) {
+        // Try numbered versions
+        const numberedPath = this.findNumberedVersion(downloadPath, jobName);
+        if (numberedPath) {
+          actualDownloadPath = numberedPath;
+        } else {
+          log(this.name, `No audio files found for album "${album.title}" - download appears incomplete`);
+          await this.triggerSearchForIncompleteDownload(album, jobName);
+          continue;
+        }
+      }
+
+      const audioFiles = this.getAudioFiles(actualDownloadPath);
+      if (audioFiles.length === 0) {
+        log(this.name, `No audio files found in ${actualDownloadPath}`);
+        await this.triggerSearchForIncompleteDownload(album, jobName);
+        continue;
+      }
+
+      log(this.name, `Found ${audioFiles.length} audio files for album "${album.title}" (${tracksWithoutFiles.length} tracks need files)`);
+
+      // Match audio files to tracks
+      let registeredCount = 0;
+
+      for (const audioFile of audioFiles) {
+        const trackNumber = this.parseTrackNumber(audioFile);
+        if (!trackNumber) {
+          log(this.name, `Could not parse track number from: ${audioFile}`);
+          continue;
+        }
+
+        // Find matching track
+        const track = tracksWithoutFiles.find(t => {
+          const absoluteNum = t.absoluteTrackNumber;
+          const trackNum = parseInt(t.trackNumber) || t.absoluteTrackNumber;
+          return absoluteNum === trackNumber || trackNum === trackNumber;
+        });
+
+        if (!track) {
+          continue; // Track already has file or doesn't exist in Lidarr
+        }
+
+        const fullPath = path.join(actualDownloadPath, audioFile);
+        log(this.name, `Registering track ${trackNumber}: ${audioFile}`);
+
+        if (!CONFIG.dryRun) {
+          const registered = await this.registerTrackFile(fullPath, album.id, track);
+          if (registered) {
+            registeredCount++;
+          }
+        } else {
+          log(this.name, `[DRY RUN] Would register: ${fullPath}`);
+          registeredCount++;
+        }
+      }
+
+      if (registeredCount > 0) {
+        log(this.name, `✅ Registered ${registeredCount} tracks for album "${album.title}"`);
+        // Clear any failed queue entries for this album
+        await this.clearFailedQueueEntries(item => item.albumId === album.id);
       }
     }
   }

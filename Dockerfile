@@ -15,7 +15,7 @@ RUN npm install --production
 COPY index.js ./
 
 # Create mount points
-RUN mkdir -p /mnt/nzbdav/content /config/sonarr
+RUN mkdir -p /mnt/nzbdav/content /config/sonarr /config/lidarr
 
 # Run as non-root user
 USER node

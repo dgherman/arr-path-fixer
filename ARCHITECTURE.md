@@ -73,6 +73,7 @@ LIDARR_ENABLED=false
 LIDARR_URL=http://localhost:8686
 LIDARR_API_KEY=<your-key>
 LIDARR_MOUNT_PATH=/mnt/nzbdav/content/music
+LIDARR_DB_PATH=/config/lidarr/lidarr.db
 LIDARR_CATEGORIES=music             # NzbDAV categories to process (default: music)
 ```
 
@@ -85,14 +86,15 @@ podman run -d \
   --userns=keep-id \
   --env-file /home/dgherman/arr-path-fixer/.env \
   -v /mnt/nzbdav/content:/mnt/nzbdav/content:ro \
-  -v /home/dgherman/nzbdav/config/sonarr:/config/sonarr \
+  -v /home/dgherman/apps/sonarr/config:/config/sonarr \
+  -v /home/dgherman/apps/lidarr/config:/config/lidarr \
   arr-path-fixer
 ```
 
 Key flags:
-- `--network=host`: Access localhost services (Radarr, Sonarr, NzbDAV)
-- `--userns=keep-id`: Preserve UID/GID for Sonarr database write access
-- Sonarr config mounted read-write for database access
+- `--network=host`: Access localhost services (Radarr, Sonarr, Lidarr, NzbDAV)
+- `--userns=keep-id`: Preserve UID/GID for Sonarr/Lidarr database write access
+- Sonarr and Lidarr config directories mounted read-write for database access
 
 ## Workflow
 
@@ -158,11 +160,19 @@ arr-path-fixer checks for `(2)`, `(3)`, etc. and uses the highest numbered versi
 - Languages stored as: `[1]` (array of language IDs, 1 = English)
 - Automatically updates Series.Path to match mount path
 
+### Lidarr Database Integration
+- Direct SQLite insertion bypasses read-only filesystem limitation
+- Album-level matching: downloads matched to albums, not just artists
+- Track number parsing from filenames (e.g., `01-artist-title.flac`)
+- Quality auto-detected from file extension (FLAC, FLAC 24bit, MP3-320, AAC-320)
+- TrackFiles table stores absolute paths (not relative to artist path)
+- Tracks table updated to link TrackFileId after registration
+
 ### Failed Queue Cleanup
 - After successfully registering a file, clears failed queue entries
 - Removes the "red cloud" / "download failed" indicators in *arr UI
-- Matches queue entries by seriesId/episodeId (Sonarr) or movieId (Radarr)
-- Sonarr/Radarr don't auto-clear these because arr-path-fixer bypasses their import flow
+- Matches queue entries by seriesId/episodeId (Sonarr), movieId (Radarr), or albumId (Lidarr)
+- *arr apps don't auto-clear these because arr-path-fixer bypasses their import flow
 
 ## NzbDAV Background Repairs
 
