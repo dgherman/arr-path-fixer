@@ -1548,10 +1548,10 @@ class LidarrMonitor extends ArrClient {
     try {
       // Get all track files with their album and artist info
       const trackFiles = db.prepare(`
-        SELECT tf.Id, tf.AlbumId, tf.Path, a.Title as AlbumTitle, ar.Name as ArtistName, ar.ArtistMetadataId
+        SELECT tf.Id, tf.AlbumId, tf.Path, a.Title as AlbumTitle, am.Name as ArtistName, a.ArtistMetadataId
         FROM TrackFiles tf
         JOIN Albums a ON a.Id = tf.AlbumId
-        JOIN Artists ar ON ar.ArtistMetadataId = a.ArtistMetadataId
+        JOIN ArtistMetadata am ON am.Id = a.ArtistMetadataId
         WHERE tf.Path LIKE ?
       `).all(this.config.mountPath + '%');
 
