@@ -1227,6 +1227,13 @@ class LidarrMonitor extends ArrClient {
       return parseInt(dotMatch[1]);
     }
 
+    // Pattern 6: [XX+YY] - XX. format (track XX of YY total)
+    // e.g., "[21+27] - 21. Murder of the Universe.mp3"
+    const bracketMatch = filename.match(/\[(\d{1,2})\+\d+\]\s*-\s*(\d{1,2})\./);
+    if (bracketMatch) {
+      return parseInt(bracketMatch[2]); // Use the number after the bracket
+    }
+
     return null;
   }
 
