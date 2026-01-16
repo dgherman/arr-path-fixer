@@ -1448,6 +1448,12 @@ class LidarrMonitor extends ArrClient {
 
       log(this.name, `Matched "${jobName}" to album "${album.title}" by "${album.artist?.artistName}" (score: ${albumScore.toFixed(2)})`);
 
+      // Skip unmonitored albums - don't trigger searches or register files
+      if (!album.monitored) {
+        log(this.name, `Skipping unmonitored album: ${album.title}`);
+        continue;
+      }
+
       // Check if album already has all tracks with files
       const tracks = await this.getAlbumTracks(album.id);
       const tracksWithoutFiles = tracks.filter(t => !t.hasFile);
