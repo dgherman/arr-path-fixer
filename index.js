@@ -501,6 +501,47 @@ class RadarrMonitor extends ArrClient {
       }
     }
   }
+
+  async cleanupStaleFiles() {
+    log(this.name, 'Checking for stale movie files...');
+    const movies = await this.getAllMovies();
+    const moviesWithFiles = movies.filter(m => m.hasFile && m.movieFile);
+    let cleanedCount = 0;
+
+    for (const movie of moviesWithFiles) {
+      const filePath = movie.movieFile.path;
+
+      // Only check files in our mount path
+      if (!filePath || !filePath.startsWith(this.config.mountPath)) continue;
+
+      // Check if file exists on disk
+      if (!fs.existsSync(filePath)) {
+        log(this.name, `Stale file detected: "${movie.title}" - ${filePath}`);
+
+        if (!CONFIG.dryRun) {
+          try {
+            // Delete the movie file record via API
+            await this.axios.delete(`/api/${this.apiVersion}/moviefile/${movie.movieFile.id}`);
+            log(this.name, `Deleted stale movie file record for: ${movie.title}`);
+
+            // Trigger a search for the now-missing movie
+            await this.triggerSearchForIncompleteDownload(movie, movie.title);
+            cleanedCount++;
+          } catch (error) {
+            log(this.name, `Failed to delete movie file: ${error.message}`);
+          }
+        } else {
+          log(this.name, `[DRY RUN] Would delete stale file and trigger search`);
+          cleanedCount++;
+        }
+      }
+    }
+
+    if (cleanedCount > 0) {
+      log(this.name, `🧹 Cleaned up ${cleanedCount} stale movie files`);
+    }
+    return cleanedCount;
+  }
 }
 
 // Sonarr-specific handler
@@ -1009,6 +1050,58 @@ class SonarrMonitor extends ArrClient {
       }
     }
   }
+
+  async cleanupStaleFiles() {
+    const db = this.getDatabase();
+    if (!db) {
+      log(this.name, 'Database not available for stale file cleanup');
+      return 0;
+    }
+
+    log(this.name, 'Checking for stale episode files...');
+    let cleanedCount = 0;
+
+    try {
+      // Get all episode files in our mount path
+      const episodeFiles = db.prepare(`
+        SELECT ef.Id, ef.SeriesId, ef.RelativePath, s.Title as SeriesTitle
+        FROM EpisodeFiles ef
+        JOIN Series s ON s.Id = ef.SeriesId
+      `).all();
+
+      for (const ef of episodeFiles) {
+        const fullPath = path.join(this.config.mountPath, ef.RelativePath);
+
+        // Check if file exists on disk
+        if (!fs.existsSync(fullPath)) {
+          log(this.name, `Stale file detected: "${ef.SeriesTitle}" - ${ef.RelativePath}`);
+
+          if (!CONFIG.dryRun) {
+            // Unlink episodes from this file
+            db.prepare('UPDATE Episodes SET EpisodeFileId = 0 WHERE EpisodeFileId = ?').run(ef.Id);
+            // Delete the episode file record
+            db.prepare('DELETE FROM EpisodeFiles WHERE Id = ?').run(ef.Id);
+            log(this.name, `Deleted stale episode file record ID ${ef.Id}`);
+
+            // Trigger series refresh to update UI
+            await this.triggerCommand({ name: 'RefreshSeries', seriesId: ef.SeriesId });
+            cleanedCount++;
+          } else {
+            log(this.name, `[DRY RUN] Would delete stale file and refresh series`);
+            cleanedCount++;
+          }
+        }
+      }
+
+      if (cleanedCount > 0) {
+        log(this.name, `🧹 Cleaned up ${cleanedCount} stale episode files`);
+      }
+    } catch (error) {
+      log(this.name, `Error during stale file cleanup: ${error.message}`);
+    }
+
+    return cleanedCount;
+  }
 }
 
 // Lidarr-specific handler
@@ -1430,6 +1523,63 @@ class LidarrMonitor extends ArrClient {
       log(this.name, `Failed to trigger artist refresh: ${error.message}`);
     }
   }
+
+  async cleanupStaleFiles() {
+    const db = this.getDatabase();
+    if (!db) {
+      log(this.name, 'Database not available for stale file cleanup');
+      return 0;
+    }
+
+    log(this.name, 'Checking for stale track files...');
+    let cleanedCount = 0;
+    const artistsToRefresh = new Set();
+
+    try {
+      // Get all track files with their album and artist info
+      const trackFiles = db.prepare(`
+        SELECT tf.Id, tf.AlbumId, tf.Path, a.Title as AlbumTitle, ar.Name as ArtistName, ar.ArtistMetadataId
+        FROM TrackFiles tf
+        JOIN Albums a ON a.Id = tf.AlbumId
+        JOIN Artists ar ON ar.ArtistMetadataId = a.ArtistMetadataId
+        WHERE tf.Path LIKE ?
+      `).all(this.config.mountPath + '%');
+
+      for (const tf of trackFiles) {
+        // Check if file exists on disk
+        if (!fs.existsSync(tf.Path)) {
+          log(this.name, `Stale file detected: "${tf.ArtistName}" - "${tf.AlbumTitle}" - ${path.basename(tf.Path)}`);
+
+          if (!CONFIG.dryRun) {
+            // Unlink tracks from this file
+            db.prepare('UPDATE Tracks SET TrackFileId = 0 WHERE TrackFileId = ?').run(tf.Id);
+            // Delete the track file record
+            db.prepare('DELETE FROM TrackFiles WHERE Id = ?').run(tf.Id);
+            log(this.name, `Deleted stale track file record ID ${tf.Id}`);
+
+            artistsToRefresh.add(tf.ArtistMetadataId);
+            cleanedCount++;
+          } else {
+            log(this.name, `[DRY RUN] Would delete stale file and refresh artist`);
+            cleanedCount++;
+          }
+        }
+      }
+
+      // Refresh affected artists and trigger searches for albums that now have missing tracks
+      for (const artistMetadataId of artistsToRefresh) {
+        await this.refreshArtist(artistMetadataId);
+      }
+
+      if (cleanedCount > 0) {
+        log(this.name, `🧹 Cleaned up ${cleanedCount} stale track files`);
+      }
+    } catch (error) {
+      log(this.name, `Error during stale file cleanup: ${error.message}`);
+    }
+
+    return cleanedCount;
+  }
 }
 
 // Main monitoring loop
@@ -1462,6 +1612,9 @@ async function monitorAll() {
   log('Main', `Search cooldown: ${CONFIG.searchCooldownMs / 60000} minutes`);
   log('Main', `Dry run: ${CONFIG.dryRun}`);
 
+  let lastStaleCleanup = 0;
+  const staleCleanupIntervalMs = 60 * 60 * 1000; // Run stale file cleanup every hour
+
   async function poll() {
     // Fetch NzbDAV history once
     const nzbdavHistory = await fetchNzbdavHistory();
@@ -1474,6 +1627,22 @@ async function monitorAll() {
       } catch (error) {
         log(monitor.name, `Error in monitor: ${error.message}`);
       }
+    }
+
+    // Run stale file cleanup periodically (every hour)
+    const now = Date.now();
+    if (now - lastStaleCleanup >= staleCleanupIntervalMs) {
+      log('Main', 'Running stale file cleanup...');
+      for (const monitor of monitors) {
+        try {
+          if (monitor.cleanupStaleFiles) {
+            await monitor.cleanupStaleFiles();
+          }
+        } catch (error) {
+          log(monitor.name, `Error in stale file cleanup: ${error.message}`);
+        }
+      }
+      lastStaleCleanup = now;
     }
   }
 
