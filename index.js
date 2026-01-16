@@ -524,8 +524,12 @@ class RadarrMonitor extends ArrClient {
             await this.axios.delete(`/api/${this.apiVersion}/moviefile/${movie.movieFile.id}`);
             log(this.name, `Deleted stale movie file record for: ${movie.title}`);
 
-            // Trigger a search for the now-missing movie
-            await this.triggerSearchForIncompleteDownload(movie, movie.title);
+            // Only trigger search if movie is monitored
+            if (movie.monitored) {
+              await this.triggerSearchForIncompleteDownload(movie, movie.title);
+            } else {
+              log(this.name, `Skipping search for unmonitored movie: ${movie.title}`);
+            }
             cleanedCount++;
           } catch (error) {
             log(this.name, `Failed to delete movie file: ${error.message}`);
@@ -1064,7 +1068,7 @@ class SonarrMonitor extends ArrClient {
     try {
       // Get all episode files with their linked episodes
       const episodeFiles = db.prepare(`
-        SELECT ef.Id, ef.SeriesId, ef.RelativePath, s.Title as SeriesTitle,
+        SELECT ef.Id, ef.SeriesId, ef.RelativePath, s.Title as SeriesTitle, s.Monitored as SeriesMonitored,
                GROUP_CONCAT(e.Id) as EpisodeIds
         FROM EpisodeFiles ef
         JOIN Series s ON s.Id = ef.SeriesId
@@ -1089,10 +1093,12 @@ class SonarrMonitor extends ArrClient {
             db.prepare('DELETE FROM EpisodeFiles WHERE Id = ?').run(ef.Id);
             log(this.name, `Deleted stale episode file record ID ${ef.Id}`);
 
-            // Trigger search for the affected episodes
-            if (episodeIds.length > 0) {
+            // Only trigger search if series is monitored
+            if (ef.SeriesMonitored && episodeIds.length > 0) {
               await this.triggerCommand({ name: 'EpisodeSearch', episodeIds });
               log(this.name, `Triggered search for ${episodeIds.length} episode(s)`);
+            } else if (!ef.SeriesMonitored) {
+              log(this.name, `Skipping search for unmonitored series: ${ef.SeriesTitle}`);
             }
             cleanedCount++;
           } else {
@@ -1561,7 +1567,7 @@ class LidarrMonitor extends ArrClient {
     try {
       // Get all track files with their album and artist info
       const trackFiles = db.prepare(`
-        SELECT tf.Id, tf.AlbumId, tf.Path, a.Title as AlbumTitle, am.Name as ArtistName, a.ArtistMetadataId
+        SELECT tf.Id, tf.AlbumId, tf.Path, a.Title as AlbumTitle, a.Monitored as AlbumMonitored, am.Name as ArtistName, a.ArtistMetadataId
         FROM TrackFiles tf
         JOIN Albums a ON a.Id = tf.AlbumId
         JOIN ArtistMetadata am ON am.Id = a.ArtistMetadataId
@@ -1581,7 +1587,12 @@ class LidarrMonitor extends ArrClient {
             log(this.name, `Deleted stale track file record ID ${tf.Id}`);
 
             artistsToRefresh.add(tf.ArtistMetadataId);
-            albumsToSearch.add(tf.AlbumId);
+            // Only search for monitored albums
+            if (tf.AlbumMonitored) {
+              albumsToSearch.add(tf.AlbumId);
+            } else {
+              log(this.name, `Skipping search for unmonitored album: ${tf.AlbumTitle}`);
+            }
             cleanedCount++;
           } else {
             log(this.name, `[DRY RUN] Would delete stale file and trigger search`);
