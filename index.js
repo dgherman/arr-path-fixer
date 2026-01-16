@@ -1062,11 +1062,14 @@ class SonarrMonitor extends ArrClient {
     let cleanedCount = 0;
 
     try {
-      // Get all episode files in our mount path
+      // Get all episode files with their linked episodes
       const episodeFiles = db.prepare(`
-        SELECT ef.Id, ef.SeriesId, ef.RelativePath, s.Title as SeriesTitle
+        SELECT ef.Id, ef.SeriesId, ef.RelativePath, s.Title as SeriesTitle,
+               GROUP_CONCAT(e.Id) as EpisodeIds
         FROM EpisodeFiles ef
         JOIN Series s ON s.Id = ef.SeriesId
+        LEFT JOIN Episodes e ON e.EpisodeFileId = ef.Id
+        GROUP BY ef.Id
       `).all();
 
       for (const ef of episodeFiles) {
@@ -1077,17 +1080,23 @@ class SonarrMonitor extends ArrClient {
           log(this.name, `Stale file detected: "${ef.SeriesTitle}" - ${ef.RelativePath}`);
 
           if (!CONFIG.dryRun) {
+            // Get episode IDs before unlinking
+            const episodeIds = ef.EpisodeIds ? ef.EpisodeIds.split(',').map(id => parseInt(id)) : [];
+
             // Unlink episodes from this file
             db.prepare('UPDATE Episodes SET EpisodeFileId = 0 WHERE EpisodeFileId = ?').run(ef.Id);
             // Delete the episode file record
             db.prepare('DELETE FROM EpisodeFiles WHERE Id = ?').run(ef.Id);
             log(this.name, `Deleted stale episode file record ID ${ef.Id}`);
 
-            // Trigger series refresh to update UI
-            await this.triggerCommand({ name: 'RefreshSeries', seriesId: ef.SeriesId });
+            // Trigger search for the affected episodes
+            if (episodeIds.length > 0) {
+              await this.triggerCommand({ name: 'EpisodeSearch', episodeIds });
+              log(this.name, `Triggered search for ${episodeIds.length} episode(s)`);
+            }
             cleanedCount++;
           } else {
-            log(this.name, `[DRY RUN] Would delete stale file and refresh series`);
+            log(this.name, `[DRY RUN] Would delete stale file and trigger search`);
             cleanedCount++;
           }
         }
@@ -1534,6 +1543,7 @@ class LidarrMonitor extends ArrClient {
     log(this.name, 'Checking for stale track files...');
     let cleanedCount = 0;
     const artistsToRefresh = new Set();
+    const albumsToSearch = new Set();
 
     try {
       // Get all track files with their album and artist info
@@ -1558,17 +1568,25 @@ class LidarrMonitor extends ArrClient {
             log(this.name, `Deleted stale track file record ID ${tf.Id}`);
 
             artistsToRefresh.add(tf.ArtistMetadataId);
+            albumsToSearch.add(tf.AlbumId);
             cleanedCount++;
           } else {
-            log(this.name, `[DRY RUN] Would delete stale file and refresh artist`);
+            log(this.name, `[DRY RUN] Would delete stale file and trigger search`);
             cleanedCount++;
           }
         }
       }
 
-      // Refresh affected artists and trigger searches for albums that now have missing tracks
+      // Refresh affected artists to update UI
       for (const artistMetadataId of artistsToRefresh) {
         await this.refreshArtist(artistMetadataId);
+      }
+
+      // Trigger searches for affected albums
+      if (albumsToSearch.size > 0) {
+        const albumIds = Array.from(albumsToSearch);
+        await this.triggerCommand({ name: 'AlbumSearch', albumIds });
+        log(this.name, `Triggered search for ${albumIds.length} album(s)`);
       }
 
       if (cleanedCount > 0) {
