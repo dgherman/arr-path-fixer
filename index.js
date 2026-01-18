@@ -1519,7 +1519,7 @@ class LidarrMonitor extends ArrClient {
       let registeredCount = 0;
 
       for (const audioFile of audioFiles) {
-        const trackNumber = this.parseTrackNumber(audioFile);
+        const trackNumber = this.parseTrackNumber(path.basename(audioFile));
         if (!trackNumber) {
           log(this.name, `Could not parse track number from: ${audioFile}`);
           continue;
