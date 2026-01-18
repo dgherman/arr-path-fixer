@@ -1334,10 +1334,20 @@ class LidarrMonitor extends ArrClient {
     }
   }
 
-  hasAudioFiles(dirPath) {
+  hasAudioFiles(dirPath, maxDepth = 3) {
     try {
-      const files = fs.readdirSync(dirPath);
-      return files.some(f => /\.(flac|mp3|m4a|aac|ogg|wav)$/i.test(f));
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isFile() && /\.(flac|mp3|m4a|aac|ogg|wav)$/i.test(entry.name)) {
+          return true;
+        }
+        if (entry.isDirectory() && maxDepth > 0) {
+          if (this.hasAudioFiles(path.join(dirPath, entry.name), maxDepth - 1)) {
+            return true;
+          }
+        }
+      }
+      return false;
     } catch {
       return false;
     }
