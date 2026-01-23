@@ -36,8 +36,12 @@ const CONFIG = {
   },
   pollInterval: parseInt(process.env.POLL_INTERVAL_SECONDS || '60') * 1000,
   searchCooldownMs: parseInt(process.env.SEARCH_COOLDOWN_MINUTES || '1440') * 60 * 1000, // Default 24 hours
+  startupGracePeriodMs: parseInt(process.env.STARTUP_GRACE_PERIOD_MINUTES || '5') * 60 * 1000, // Default 5 minutes
   dryRun: process.env.DRY_RUN === 'true'
 };
+
+// Track when the service started
+const SERVICE_START_TIME = Date.now();
 
 const log = (service, message) => {
   const timestamp = new Date().toISOString();
@@ -134,6 +138,47 @@ function findBestMatch(targetTitle, targetYear, items, getTitleFn, getYearFn = n
   }
 
   return { match: bestMatch, score: bestScore };
+}
+
+// Validate that a mount path is ready and populated (not an empty/stale VFS cache)
+function isMountReady(mountPath, minExpectedFiles = 1) {
+  try {
+    if (!fs.existsSync(mountPath)) {
+      return { ready: false, reason: 'Mount path does not exist' };
+    }
+
+    // Check if we can read the directory
+    const entries = fs.readdirSync(mountPath, { withFileTypes: true });
+
+    // Count files and directories recursively (shallow - just first level subdirs)
+    let fileCount = 0;
+    for (const entry of entries) {
+      if (entry.isFile()) {
+        fileCount++;
+      } else if (entry.isDirectory()) {
+        try {
+          const subEntries = fs.readdirSync(path.join(mountPath, entry.name));
+          fileCount += subEntries.length;
+        } catch {
+          // Subdirectory not readable, might still be populating
+        }
+      }
+    }
+
+    if (fileCount < minExpectedFiles) {
+      return { ready: false, reason: `Mount appears empty or still populating (found ${fileCount} entries)` };
+    }
+
+    return { ready: true, reason: null };
+  } catch (error) {
+    return { ready: false, reason: `Error checking mount: ${error.message}` };
+  }
+}
+
+// Check if we're still in the startup grace period
+function isInStartupGracePeriod() {
+  const elapsed = Date.now() - SERVICE_START_TIME;
+  return elapsed < CONFIG.startupGracePeriodMs;
 }
 
 // Generic API client for *arr services
@@ -503,6 +548,20 @@ class RadarrMonitor extends ArrClient {
   }
 
   async cleanupStaleFiles() {
+    // Skip during startup grace period to allow VFS cache to populate
+    if (isInStartupGracePeriod()) {
+      const remainingMs = CONFIG.startupGracePeriodMs - (Date.now() - SERVICE_START_TIME);
+      log(this.name, `Skipping stale file cleanup - in startup grace period (${Math.ceil(remainingMs / 1000)}s remaining)`);
+      return 0;
+    }
+
+    // Verify mount is ready before checking for stale files
+    const mountCheck = isMountReady(this.config.mountPath);
+    if (!mountCheck.ready) {
+      log(this.name, `Skipping stale file cleanup - ${mountCheck.reason}`);
+      return 0;
+    }
+
     log(this.name, 'Checking for stale movie files...');
     const movies = await this.getAllMovies();
     const moviesWithFiles = movies.filter(m => m.hasFile && m.movieFile);
@@ -1056,6 +1115,20 @@ class SonarrMonitor extends ArrClient {
   }
 
   async cleanupStaleFiles() {
+    // Skip during startup grace period to allow VFS cache to populate
+    if (isInStartupGracePeriod()) {
+      const remainingMs = CONFIG.startupGracePeriodMs - (Date.now() - SERVICE_START_TIME);
+      log(this.name, `Skipping stale file cleanup - in startup grace period (${Math.ceil(remainingMs / 1000)}s remaining)`);
+      return 0;
+    }
+
+    // Verify mount is ready before checking for stale files
+    const mountCheck = isMountReady(this.config.mountPath);
+    if (!mountCheck.ready) {
+      log(this.name, `Skipping stale file cleanup - ${mountCheck.reason}`);
+      return 0;
+    }
+
     const db = this.getDatabase();
     if (!db) {
       log(this.name, 'Database not available for stale file cleanup');
@@ -1574,6 +1647,20 @@ class LidarrMonitor extends ArrClient {
   }
 
   async cleanupStaleFiles() {
+    // Skip during startup grace period to allow VFS cache to populate
+    if (isInStartupGracePeriod()) {
+      const remainingMs = CONFIG.startupGracePeriodMs - (Date.now() - SERVICE_START_TIME);
+      log(this.name, `Skipping stale file cleanup - in startup grace period (${Math.ceil(remainingMs / 1000)}s remaining)`);
+      return 0;
+    }
+
+    // Verify mount is ready before checking for stale files
+    const mountCheck = isMountReady(this.config.mountPath);
+    if (!mountCheck.ready) {
+      log(this.name, `Skipping stale file cleanup - ${mountCheck.reason}`);
+      return 0;
+    }
+
     const db = this.getDatabase();
     if (!db) {
       log(this.name, 'Database not available for stale file cleanup');
@@ -1673,6 +1760,7 @@ async function monitorAll() {
   log('Main', `NzbDAV URL: ${CONFIG.nzbdav.url}`);
   log('Main', `Poll interval: ${CONFIG.pollInterval / 1000}s`);
   log('Main', `Search cooldown: ${CONFIG.searchCooldownMs / 60000} minutes`);
+  log('Main', `Startup grace period: ${CONFIG.startupGracePeriodMs / 60000} minutes (stale cleanup delayed)`);
   log('Main', `Dry run: ${CONFIG.dryRun}`);
 
   let lastStaleCleanup = 0;
