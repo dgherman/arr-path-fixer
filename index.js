@@ -37,7 +37,13 @@ const CONFIG = {
   pollInterval: parseInt(process.env.POLL_INTERVAL_SECONDS || '60') * 1000,
   searchCooldownMs: parseInt(process.env.SEARCH_COOLDOWN_MINUTES || '1440') * 60 * 1000, // Default 24 hours
   startupGracePeriodMs: parseInt(process.env.STARTUP_GRACE_PERIOD_MINUTES || '5') * 60 * 1000, // Default 5 minutes
-  dryRun: process.env.DRY_RUN === 'true'
+  dryRun: process.env.DRY_RUN === 'true',
+  plex: {
+    tvSymlinkPath: process.env.PLEX_TV_SYMLINK_PATH || '',
+    moviesSymlinkPath: process.env.PLEX_MOVIES_SYMLINK_PATH || '',
+    nzbdavHostMount: process.env.NZBDAV_HOST_MOUNT || '',
+    nzbdavContainerMount: process.env.NZBDAV_CONTAINER_MOUNT || '/mnt/nzbdav'
+  }
 };
 
 // Track when the service started
@@ -1762,6 +1768,272 @@ class LidarrMonitor extends ArrClient {
   }
 }
 
+// Plex symlink layer - presents nzbdav content in organized Show/Season/Episode structure
+class PlexSymlinkManager {
+  constructor(config) {
+    this.tvSymlinkPath = config.tvSymlinkPath;
+    this.moviesSymlinkPath = config.moviesSymlinkPath;
+    this.nzbdavHostMount = config.nzbdavHostMount;
+    this.nzbdavContainerMount = config.nzbdavContainerMount;
+  }
+
+  // Translate container-side FUSE path to host-side path for symlink targets
+  toHostPath(containerPath) {
+    return containerPath.replace(this.nzbdavContainerMount, this.nzbdavHostMount);
+  }
+
+  // Remove filesystem-unsafe characters from titles
+  sanitizeTitle(title) {
+    return title
+      .replace(/[/\\:*?"<>|]/g, '-')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  // Recursively collect all symlinks under dir: Map<path, target>
+  walkSymlinks(dir) {
+    const links = new Map();
+    if (!fs.existsSync(dir)) return links;
+
+    const walk = (currentDir) => {
+      let entries;
+      try {
+        entries = fs.readdirSync(currentDir, { withFileTypes: true });
+      } catch (err) {
+        log('PlexSymlink', `Error reading dir ${currentDir}: ${err.message}`);
+        return;
+      }
+      for (const entry of entries) {
+        const fullPath = path.join(currentDir, entry.name);
+        if (entry.isSymbolicLink()) {
+          try {
+            links.set(fullPath, fs.readlinkSync(fullPath));
+          } catch (err) {
+            log('PlexSymlink', `Error reading link ${fullPath}: ${err.message}`);
+          }
+        } else if (entry.isDirectory()) {
+          walk(fullPath);
+        }
+      }
+    };
+
+    walk(dir);
+    return links;
+  }
+
+  // Build expected TV symlinks from Sonarr API
+  // Returns Map<symlinkPath, hostTargetPath> or null on API failure
+  async buildExpectedTvLinks(sonarrMonitor) {
+    const links = new Map();
+
+    let allSeries;
+    try {
+      allSeries = await sonarrMonitor.getAllSeries();
+    } catch (err) {
+      log('PlexSymlink', `Failed to fetch Sonarr series: ${err.message}`);
+      return null;
+    }
+
+    for (const series of allSeries) {
+      let episodes, episodeFiles;
+      try {
+        const epResp = await sonarrMonitor.axios.get(`/api/v3/episode`, { params: { seriesId: series.id } });
+        episodes = epResp.data || [];
+        const efResp = await sonarrMonitor.axios.get(`/api/v3/episodefile`, { params: { seriesId: series.id } });
+        episodeFiles = efResp.data || [];
+      } catch (err) {
+        log('PlexSymlink', `Failed to fetch episodes for "${series.title}": ${err.message}`);
+        continue;
+      }
+
+      if (episodeFiles.length === 0) continue;
+
+      // Build map: episodeFileId -> array of episodes sharing that file (multi-episode)
+      const fileIdToEpisodes = new Map();
+      for (const ep of episodes) {
+        if (!ep.episodeFileId || ep.episodeFileId === 0) continue;
+        if (!fileIdToEpisodes.has(ep.episodeFileId)) fileIdToEpisodes.set(ep.episodeFileId, []);
+        fileIdToEpisodes.get(ep.episodeFileId).push(ep);
+      }
+
+      for (const ef of episodeFiles) {
+        const eps = fileIdToEpisodes.get(ef.id);
+        if (!eps || eps.length === 0) continue;
+
+        eps.sort((a, b) => a.episodeNumber - b.episodeNumber);
+        const firstEp = eps[0];
+        const seasonNum = String(firstEp.seasonNumber).padStart(2, '0');
+        const epNums = eps.map(e => `E${String(e.episodeNumber).padStart(2, '0')}`).join('');
+        const ext = path.extname(ef.relativePath);
+
+        const seriesTitle = this.sanitizeTitle(series.title);
+        const episodeTitle = firstEp.title ? this.sanitizeTitle(firstEp.title) : '';
+        const filename = episodeTitle
+          ? `${seriesTitle} - S${seasonNum}${epNums} - ${episodeTitle}${ext}`
+          : `${seriesTitle} - S${seasonNum}${epNums}${ext}`;
+
+        const symlinkPath = path.join(
+          this.tvSymlinkPath,
+          `${seriesTitle} (${series.year})`,
+          `Season ${seasonNum}`,
+          filename
+        );
+
+        const containerPath = path.join(sonarrMonitor.config.mountPath, ef.relativePath);
+        links.set(symlinkPath, this.toHostPath(containerPath));
+      }
+    }
+
+    return links;
+  }
+
+  // Build expected movie symlinks from Radarr API
+  // Returns Map<symlinkPath, hostTargetPath> or null on API failure
+  async buildExpectedMovieLinks(radarrMonitor) {
+    const links = new Map();
+
+    let movies;
+    try {
+      movies = await radarrMonitor.getAllMovies();
+    } catch (err) {
+      log('PlexSymlink', `Failed to fetch Radarr movies: ${err.message}`);
+      return null;
+    }
+
+    for (const movie of movies) {
+      if (!movie.hasFile || !movie.movieFile || !movie.movieFile.path) continue;
+
+      const ext = path.extname(movie.movieFile.path);
+      const title = this.sanitizeTitle(movie.title);
+      const year = movie.year;
+      const filename = `${title} (${year})${ext}`;
+
+      const symlinkPath = path.join(
+        this.moviesSymlinkPath,
+        `${title} (${year})`,
+        filename
+      );
+
+      links.set(symlinkPath, this.toHostPath(movie.movieFile.path));
+    }
+
+    return links;
+  }
+
+  // Remove a directory if it's empty (walk up to but not including the root symlink dir)
+  removeEmptyDirs(dir) {
+    if (dir === this.tvSymlinkPath || dir === this.moviesSymlinkPath) return;
+    try {
+      const entries = fs.readdirSync(dir);
+      if (entries.length === 0) {
+        fs.rmdirSync(dir);
+        this.removeEmptyDirs(path.dirname(dir));
+      }
+    } catch {
+      // Ignore - dir may have been removed already or may have other files
+    }
+  }
+
+  async reconcile(monitors) {
+    const sonarrMonitor = monitors.find(m => m instanceof SonarrMonitor);
+    const radarrMonitor = monitors.find(m => m instanceof RadarrMonitor);
+
+    // Build expected links (null return means API failure - don't remove existing links)
+    const expectedLinks = new Map();
+    let tvFailed = false;
+    let moviesFailed = false;
+
+    if (sonarrMonitor && this.tvSymlinkPath) {
+      const tvLinks = await this.buildExpectedTvLinks(sonarrMonitor);
+      if (tvLinks === null) {
+        tvFailed = true;
+        log('PlexSymlink', 'Skipping TV reconciliation due to Sonarr API failure');
+      } else {
+        for (const [k, v] of tvLinks) expectedLinks.set(k, v);
+        log('PlexSymlink', `TV: ${tvLinks.size} expected symlinks`);
+      }
+    }
+
+    if (radarrMonitor && this.moviesSymlinkPath) {
+      const movieLinks = await this.buildExpectedMovieLinks(radarrMonitor);
+      if (movieLinks === null) {
+        moviesFailed = true;
+        log('PlexSymlink', 'Skipping movies reconciliation due to Radarr API failure');
+      } else {
+        for (const [k, v] of movieLinks) expectedLinks.set(k, v);
+        log('PlexSymlink', `Movies: ${movieLinks.size} expected symlinks`);
+      }
+    }
+
+    // Collect existing symlinks (only from dirs whose API calls succeeded)
+    const existingLinks = new Map();
+    if (!tvFailed && this.tvSymlinkPath) {
+      for (const [k, v] of this.walkSymlinks(this.tvSymlinkPath)) existingLinks.set(k, v);
+    }
+    if (!moviesFailed && this.moviesSymlinkPath) {
+      for (const [k, v] of this.walkSymlinks(this.moviesSymlinkPath)) existingLinks.set(k, v);
+    }
+
+    let created = 0, removed = 0, updated = 0, errors = 0;
+
+    // Create or update
+    for (const [symlinkPath, targetPath] of expectedLinks) {
+      const existing = existingLinks.get(symlinkPath);
+
+      if (existing === undefined) {
+        if (!CONFIG.dryRun) {
+          try {
+            fs.mkdirSync(path.dirname(symlinkPath), { recursive: true });
+            fs.symlinkSync(targetPath, symlinkPath);
+            created++;
+          } catch (err) {
+            log('PlexSymlink', `Error creating ${path.basename(symlinkPath)}: ${err.message}`);
+            errors++;
+          }
+        } else {
+          log('PlexSymlink', `[DRY RUN] Would create: ${symlinkPath}`);
+          created++;
+        }
+      } else if (existing !== targetPath) {
+        if (!CONFIG.dryRun) {
+          try {
+            fs.unlinkSync(symlinkPath);
+            fs.symlinkSync(targetPath, symlinkPath);
+            updated++;
+          } catch (err) {
+            log('PlexSymlink', `Error updating ${path.basename(symlinkPath)}: ${err.message}`);
+            errors++;
+          }
+        } else {
+          log('PlexSymlink', `[DRY RUN] Would update: ${symlinkPath}`);
+          updated++;
+        }
+      }
+    }
+
+    // Remove stale
+    for (const [symlinkPath] of existingLinks) {
+      if (!expectedLinks.has(symlinkPath)) {
+        if (!CONFIG.dryRun) {
+          try {
+            fs.unlinkSync(symlinkPath);
+            this.removeEmptyDirs(path.dirname(symlinkPath));
+            removed++;
+          } catch (err) {
+            log('PlexSymlink', `Error removing ${path.basename(symlinkPath)}: ${err.message}`);
+            errors++;
+          }
+        } else {
+          log('PlexSymlink', `[DRY RUN] Would remove: ${symlinkPath}`);
+          removed++;
+        }
+      }
+    }
+
+    log('PlexSymlink', `Done: +${created} created, ~${updated} updated, -${removed} removed, ${errors} errors`);
+  }
+}
+
 // Main monitoring loop
 async function monitorAll() {
   const monitors = [];
@@ -1786,6 +2058,13 @@ async function monitorAll() {
     process.exit(1);
   }
 
+  // Set up Plex symlink manager if configured
+  let plexSymlinkManager = null;
+  if (CONFIG.plex.tvSymlinkPath && CONFIG.plex.moviesSymlinkPath && CONFIG.plex.nzbdavHostMount) {
+    plexSymlinkManager = new PlexSymlinkManager(CONFIG.plex);
+    log('Main', `Plex symlink manager enabled (TV: ${CONFIG.plex.tvSymlinkPath}, Movies: ${CONFIG.plex.moviesSymlinkPath})`);
+  }
+
   log('Main', `Starting monitors: ${monitors.map(m => m.name).join(', ')}`);
   log('Main', `NzbDAV URL: ${CONFIG.nzbdav.url}`);
   log('Main', `Poll interval: ${CONFIG.pollInterval / 1000}s`);
@@ -1807,6 +2086,15 @@ async function monitorAll() {
         await monitor.processHistory(nzbdavHistory);
       } catch (error) {
         log(monitor.name, `Error in monitor: ${error.message}`);
+      }
+    }
+
+    // Reconcile Plex symlink layer after all monitors have processed
+    if (plexSymlinkManager) {
+      try {
+        await plexSymlinkManager.reconcile(monitors);
+      } catch (error) {
+        log('PlexSymlink', `Error in reconciliation: ${error.message}`);
       }
     }
 
