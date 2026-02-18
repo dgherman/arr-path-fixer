@@ -341,12 +341,42 @@ class ArrClient {
     }
   }
 
-  hasMediaFiles(dirPath) {
+  hasMediaFiles(dirPath, maxDepth = 3) {
     try {
-      const files = fs.readdirSync(dirPath);
-      return files.some(f => /\.(mkv|mp4|avi|mov|flac|mp3|m4a)$/i.test(f));
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isFile() && /\.(mkv|mp4|avi|mov|flac|mp3|m4a)$/i.test(entry.name)) {
+          return true;
+        }
+        if (entry.isDirectory() && maxDepth > 0) {
+          if (this.hasMediaFiles(path.join(dirPath, entry.name), maxDepth - 1)) {
+            return true;
+          }
+        }
+      }
+      return false;
     } catch {
       return false;
+    }
+  }
+
+  // Recursively find video files, returning paths relative to basePath
+  getVideoFiles(dirPath, basePath = null, maxDepth = 3) {
+    if (basePath === null) basePath = dirPath;
+    try {
+      const results = [];
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isFile() && /\.(mkv|mp4|avi|mov)$/i.test(entry.name)) {
+          results.push(path.relative(basePath, fullPath));
+        } else if (entry.isDirectory() && maxDepth > 0) {
+          results.push(...this.getVideoFiles(fullPath, basePath, maxDepth - 1));
+        }
+      }
+      return results;
+    } catch {
+      return [];
     }
   }
 
@@ -765,13 +795,12 @@ class SonarrMonitor extends ArrClient {
       return;
     }
 
-    // Check if directory exists and has files
+    // Check if directory exists and has files (recursive scan for nested structures)
     let videoFiles = [];
     let actualDownloadPath = downloadPath;
     try {
       if (fs.existsSync(downloadPath)) {
-        const files = fs.readdirSync(downloadPath);
-        videoFiles = files.filter(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+        videoFiles = this.getVideoFiles(downloadPath);
       }
 
       // If no video files in original path, check for numbered versions (2), (3), etc.
@@ -779,8 +808,7 @@ class SonarrMonitor extends ArrClient {
         const numberedPath = this.findNumberedVersion(downloadPath, jobName);
         if (numberedPath) {
           actualDownloadPath = numberedPath;
-          const files = fs.readdirSync(numberedPath);
-          videoFiles = files.filter(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+          videoFiles = this.getVideoFiles(numberedPath);
         }
       }
     } catch (error) {
@@ -800,8 +828,9 @@ class SonarrMonitor extends ArrClient {
     let alreadyHaveCount = 0;
 
     for (const videoFile of videoFiles) {
-      // Parse episode info from the video filename
-      const fileEpisodeInfo = this.parseEpisodeInfo(videoFile);
+      // Parse episode info from the video filename (use basename for parsing)
+      const videoBasename = path.basename(videoFile);
+      const fileEpisodeInfo = this.parseEpisodeInfo(videoBasename);
       if (!fileEpisodeInfo) {
         log(this.name, `Could not parse episode info from file: ${videoFile}`);
         continue;
@@ -822,6 +851,7 @@ class SonarrMonitor extends ArrClient {
         continue;
       }
 
+      // videoFile is relative to actualDownloadPath
       const fullPath = path.join(actualDownloadPath, videoFile);
       log(this.name, `Registering ${series.title} S${fileEpisodeInfo.season}E${fileEpisodeInfo.episode}: ${videoFile}`);
 
@@ -832,7 +862,7 @@ class SonarrMonitor extends ArrClient {
           seasonNumber: fileEpisodeInfo.season,
           quality: { quality: { id: 1, name: 'Unknown' } },
           releaseGroup: '',
-          sceneName: videoFile
+          sceneName: videoBasename
         };
 
         const registered = await this.registerEpisodeFile(episodeFile, [episode.id]);
