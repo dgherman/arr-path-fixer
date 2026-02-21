@@ -875,8 +875,35 @@ class SonarrMonitor extends ArrClient {
       }
 
       if (episode.hasFile) {
-        alreadyHaveCount++;
-        continue;
+        let isStale = false;
+        const db = this.getDatabase();
+        if (db && episode.episodeFileId) {
+          try {
+            const ef = db.prepare('SELECT RelativePath FROM EpisodeFiles WHERE Id = ?').get(episode.episodeFileId);
+            if (ef) {
+              isStale = !fs.existsSync(path.join(this.config.mountPath, ef.RelativePath));
+            }
+          } catch (err) {
+            // DB lookup failed - assume file exists and skip
+          }
+        }
+        if (!isStale) {
+          alreadyHaveCount++;
+          continue;
+        }
+        // Stale file - delete old record and fall through to re-register with new download
+        log(this.name, `Stale file detected for "${series.title}" S${fileEpisodeInfo.season}E${fileEpisodeInfo.episode} - replacing`);
+        if (!CONFIG.dryRun && db && episode.episodeFileId) {
+          try {
+            db.prepare('UPDATE Episodes SET EpisodeFileId = 0 WHERE Id = ?').run(episode.id);
+            db.prepare('DELETE FROM EpisodeFiles WHERE Id = ?').run(episode.episodeFileId);
+          } catch (err) {
+            log(this.name, `Failed to delete stale episode file: ${err.message}`);
+            alreadyHaveCount++;
+            continue;
+          }
+        }
+        // Fall through to re-register with the new file
       }
 
       // videoFile is relative to actualDownloadPath
@@ -1109,9 +1136,36 @@ class SonarrMonitor extends ArrClient {
         continue;
       }
 
-      // Check if episode already has a file
+      // Check if episode already has a file AND the file actually exists on disk
       if (episode.hasFile) {
-        continue;
+        let isStale = false;
+        const db = this.getDatabase();
+        if (db && episode.episodeFileId) {
+          try {
+            const ef = db.prepare('SELECT RelativePath FROM EpisodeFiles WHERE Id = ?').get(episode.episodeFileId);
+            if (ef) {
+              isStale = !fs.existsSync(path.join(this.config.mountPath, ef.RelativePath));
+            }
+          } catch (err) {
+            // DB lookup failed - assume file exists and skip
+          }
+        }
+        if (!isStale) {
+          continue;
+        }
+        // File is stale - delete the old record and fall through to register the new one
+        log(this.name, `Stale file detected for "${series.title}" S${episodeInfo.season}E${episodeInfo.episode} - replacing with new download`);
+        if (!CONFIG.dryRun && db && episode.episodeFileId) {
+          try {
+            db.prepare('UPDATE Episodes SET EpisodeFileId = 0 WHERE Id = ?').run(episode.id);
+            db.prepare('DELETE FROM EpisodeFiles WHERE Id = ?').run(episode.episodeFileId);
+            log(this.name, `Deleted stale episode file record for: ${series.title} S${episodeInfo.season}E${episodeInfo.episode}`);
+          } catch (err) {
+            log(this.name, `Failed to delete stale episode file: ${err.message}`);
+            continue;
+          }
+        }
+        // Fall through to register the new file
       }
 
       // Find the actual video file in the download directory
@@ -1224,10 +1278,16 @@ class SonarrMonitor extends ArrClient {
             db.prepare('DELETE FROM EpisodeFiles WHERE Id = ?').run(ef.Id);
             log(this.name, `Deleted stale episode file record ID ${ef.Id}`);
 
-            // Only trigger search if series is monitored
+            // Only trigger search if series is monitored AND no replacement is already on the mount.
+            // If a replacement download already exists, processHistory will pick it up on the next poll.
             if (ef.SeriesMonitored && episodeIds.length > 0) {
-              await this.triggerCommand({ name: 'EpisodeSearch', episodeIds });
-              log(this.name, `Triggered search for ${episodeIds.length} episode(s)`);
+              const replacementPath = this.findActualPath(ef.SeriesTitle, this.config.mountPath);
+              if (replacementPath) {
+                log(this.name, `Replacement already available at ${replacementPath} - skipping search, processHistory will handle it`);
+              } else {
+                await this.triggerCommand({ name: 'EpisodeSearch', episodeIds });
+                log(this.name, `Triggered search for ${episodeIds.length} episode(s)`);
+              }
             } else if (!ef.SeriesMonitored) {
               log(this.name, `Skipping search for unmonitored series: ${ef.SeriesTitle}`);
             }
