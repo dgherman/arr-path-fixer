@@ -519,6 +519,7 @@ class RadarrMonitor extends ArrClient {
 
   async processHistory(nzbdavHistory) {
     const movies = await this.getAllMovies();
+    const processedMovieIds = new Set(); // skip duplicate releases for the same movie in one poll
 
     for (const historyItem of nzbdavHistory) {
       const jobName = historyItem.job_name || historyItem.name || '';
@@ -545,6 +546,14 @@ class RadarrMonitor extends ArrClient {
       }
 
       log(this.name, `Matched "${jobName}" to "${movie.title}" (score: ${score.toFixed(2)})`);
+
+      // Skip if this movie was already handled by an earlier history item this poll.
+      // Multiple releases for the same movie in NzbDAV history would otherwise bounce
+      // the path back and forth and trigger repeated RefreshMovie commands.
+      if (processedMovieIds.has(movie.id)) {
+        log(this.name, `Skipping duplicate release for already-processed movie: ${movie.title}`);
+        continue;
+      }
 
       // Skip if already has file AND the file actually exists on disk.
       // If the file is gone (user replaced/deleted it), fall through to update the path.
@@ -578,6 +587,7 @@ class RadarrMonitor extends ArrClient {
 
       if (actualPath === movie.path) {
         log(this.name, `Path already correct: ${movie.title}`);
+        processedMovieIds.add(movie.id);
         continue;
       }
 
@@ -588,13 +598,15 @@ class RadarrMonitor extends ArrClient {
         const updated = await this.updateItem(movie.id, 'movie', movie);
 
         if (updated) {
-          log(this.name, `Triggering refresh for: ${movie.title}`);
-          await this.triggerCommand({ name: 'RefreshMovie', movieIds: [movie.id] });
+          log(this.name, `Triggering rescan for: ${movie.title}`);
+          await this.triggerCommand({ name: 'RescanMovie', movieId: movie.id });
+          processedMovieIds.add(movie.id);
           // Clear any failed queue entries for this movie
           await this.clearFailedQueueEntries(item => item.movieId === movie.id);
         }
       } else {
         log(this.name, `[DRY RUN] Would update path and refresh`);
+        processedMovieIds.add(movie.id);
       }
     }
   }
