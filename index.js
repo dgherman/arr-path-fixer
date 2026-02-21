@@ -546,9 +546,25 @@ class RadarrMonitor extends ArrClient {
 
       log(this.name, `Matched "${jobName}" to "${movie.title}" (score: ${score.toFixed(2)})`);
 
-      // Skip if already has file
+      // Skip if already has file AND the file actually exists on disk.
+      // If the file is gone (user replaced/deleted it), fall through to update the path.
       if (movie.hasFile) {
-        continue;
+        const existingFilePath = movie.movieFile?.path;
+        if (!existingFilePath || fs.existsSync(existingFilePath)) {
+          continue; // File exists (or no path info) - nothing to do
+        }
+        // File record exists in Radarr but the file is gone from disk (stale/replaced)
+        log(this.name, `Stale file detected for "${movie.title}" (${path.basename(existingFilePath)}) - replacing with new download`);
+        if (!CONFIG.dryRun) {
+          try {
+            await this.axios.delete(`/api/${this.apiVersion}/moviefile/${movie.movieFile.id}`);
+            log(this.name, `Deleted stale movie file record for: ${movie.title}`);
+          } catch (err) {
+            log(this.name, `Failed to delete stale movie file: ${err.message}`);
+            continue;
+          }
+        }
+        // Fall through to update path with new download
       }
 
       const actualPath = this.findActualPath(jobName, this.config.mountPath);
@@ -619,9 +635,15 @@ class RadarrMonitor extends ArrClient {
             await this.axios.delete(`/api/${this.apiVersion}/moviefile/${movie.movieFile.id}`);
             log(this.name, `Deleted stale movie file record for: ${movie.title}`);
 
-            // Only trigger search if movie is monitored
+            // Only trigger search if movie is monitored AND no replacement is already on the mount.
+            // If a replacement download already exists, processHistory will pick it up on the next poll.
             if (movie.monitored) {
-              await this.triggerSearchForIncompleteDownload(movie, movie.title);
+              const replacementPath = this.findActualPath(movie.title, this.config.mountPath);
+              if (replacementPath) {
+                log(this.name, `Replacement already available at ${replacementPath} - skipping search, processHistory will handle it`);
+              } else {
+                await this.triggerSearchForIncompleteDownload(movie, movie.title);
+              }
             } else {
               log(this.name, `Skipping search for unmonitored movie: ${movie.title}`);
             }
