@@ -11,7 +11,8 @@ COPY package*.json ./
 # Install dependencies (including native modules)
 RUN npm install --production
 
-# Copy application
+# Copy application (CACHE_BUST invalidates layer cache on each new commit)
+ARG CACHE_BUST
 COPY index.js ./
 
 # Create mount points
