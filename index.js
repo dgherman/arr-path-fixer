@@ -1311,29 +1311,29 @@ class SonarrMonitor extends ArrClient {
           log(this.name, `Stale file detected: "${ef.SeriesTitle}" - ${ef.RelativePath}`);
 
           if (!CONFIG.dryRun) {
-            // Get episode IDs before unlinking
             const episodeIds = ef.EpisodeIds ? ef.EpisodeIds.split(',').map(id => parseInt(id)) : [];
+            try {
+              // Delete via Sonarr API (handles episode unlinking automatically)
+              await this.axios.delete(`/api/${this.apiVersion}/episodefile/${ef.Id}`);
+              log(this.name, `Deleted stale episode file ID ${ef.Id} via API`);
 
-            // Unlink episodes from this file
-            db.prepare('UPDATE Episodes SET EpisodeFileId = 0 WHERE EpisodeFileId = ?').run(ef.Id);
-            // Delete the episode file record
-            db.prepare('DELETE FROM EpisodeFiles WHERE Id = ?').run(ef.Id);
-            log(this.name, `Deleted stale episode file record ID ${ef.Id}`);
-
-            // Only trigger search if series is monitored AND no replacement is already on the mount.
-            // If a replacement download already exists, processHistory will pick it up on the next poll.
-            if (ef.SeriesMonitored && episodeIds.length > 0) {
-              const replacementPath = this.findActualPath(ef.SeriesTitle, this.config.mountPath);
-              if (replacementPath) {
-                log(this.name, `Replacement already available at ${replacementPath} - skipping search, processHistory will handle it`);
-              } else {
-                await this.triggerCommand({ name: 'EpisodeSearch', episodeIds });
-                log(this.name, `Triggered search for ${episodeIds.length} episode(s)`);
+              // Only trigger search if series is monitored AND no replacement is already on the mount.
+              // If a replacement download already exists, processHistory will pick it up on the next poll.
+              if (ef.SeriesMonitored && episodeIds.length > 0) {
+                const replacementPath = this.findActualPath(ef.SeriesTitle, this.config.mountPath);
+                if (replacementPath) {
+                  log(this.name, `Replacement already available at ${replacementPath} - skipping search, processHistory will handle it`);
+                } else {
+                  await this.triggerCommand({ name: 'EpisodeSearch', episodeIds });
+                  log(this.name, `Triggered search for ${episodeIds.length} episode(s)`);
+                }
+              } else if (!ef.SeriesMonitored) {
+                log(this.name, `Skipping search for unmonitored series: ${ef.SeriesTitle}`);
               }
-            } else if (!ef.SeriesMonitored) {
-              log(this.name, `Skipping search for unmonitored series: ${ef.SeriesTitle}`);
+              cleanedCount++;
+            } catch (error) {
+              log(this.name, `Failed to delete episode file ${ef.Id} via API: ${error.message}`);
             }
-            cleanedCount++;
           } else {
             log(this.name, `[DRY RUN] Would delete stale file and trigger search`);
             cleanedCount++;
@@ -1852,20 +1852,22 @@ class LidarrMonitor extends ArrClient {
           log(this.name, `Stale file detected: "${tf.ArtistName}" - "${tf.AlbumTitle}" - ${path.basename(tf.Path)}`);
 
           if (!CONFIG.dryRun) {
-            // Unlink tracks from this file
-            db.prepare('UPDATE Tracks SET TrackFileId = 0 WHERE TrackFileId = ?').run(tf.Id);
-            // Delete the track file record
-            db.prepare('DELETE FROM TrackFiles WHERE Id = ?').run(tf.Id);
-            log(this.name, `Deleted stale track file record ID ${tf.Id}`);
+            try {
+              // Delete via Lidarr API (handles track unlinking automatically)
+              await this.axios.delete(`/api/${this.apiVersion}/trackfile/${tf.Id}`);
+              log(this.name, `Deleted stale track file ID ${tf.Id} via API`);
 
-            artistsToRefresh.add(tf.ArtistMetadataId);
-            // Only search for monitored albums
-            if (tf.AlbumMonitored) {
-              albumsToSearch.add(tf.AlbumId);
-            } else {
-              log(this.name, `Skipping search for unmonitored album: ${tf.AlbumTitle}`);
+              artistsToRefresh.add(tf.ArtistMetadataId);
+              // Only search for monitored albums
+              if (tf.AlbumMonitored) {
+                albumsToSearch.add(tf.AlbumId);
+              } else {
+                log(this.name, `Skipping search for unmonitored album: ${tf.AlbumTitle}`);
+              }
+              cleanedCount++;
+            } catch (error) {
+              log(this.name, `Failed to delete track file ${tf.Id} via API: ${error.message}`);
             }
-            cleanedCount++;
           } else {
             log(this.name, `[DRY RUN] Would delete stale file and trigger search`);
             cleanedCount++;
