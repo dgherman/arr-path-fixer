@@ -1161,7 +1161,7 @@ class SonarrMonitor extends ArrClient {
         releaseType: 'singleEpisode'
       }];
 
-      const response = await this.axios.put(`/api/${this.apiVersion}/manualimport`, importFiles);
+      const response = await this.axios.post(`/api/${this.apiVersion}/manualimport`, importFiles);
       return response.data;
     } catch (error) {
       log(this.name, `Error registering episode file via API: ${error.message}`);
