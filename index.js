@@ -439,6 +439,7 @@ class ArrClient {
 // Register a LocalLink in nzbdav2 so Background Repairs can find imported files
 async function registerLocalLink(nzoId, fileName, linkPath) {
   if (!CONFIG.nzbdav.apiKey) return;
+  if (!nzoId) return;
   try {
     await axios.post(
       `${CONFIG.nzbdav.url}/api/locallinks`,
@@ -623,9 +624,13 @@ class RadarrMonitor extends ArrClient {
           // Clear any failed queue entries for this movie
           await this.clearFailedQueueEntries(item => item.movieId === movie.id);
           // Scan actualPath for the video file to register in nzbdav2 LocalLinks
-          const videoFiles = fs.readdirSync(actualPath).filter(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
-          if (videoFiles.length > 0) {
-            await registerLocalLink(historyItem.nzo_id, videoFiles[0], path.join(actualPath, videoFiles[0]));
+          try {
+            const videoFiles = fs.readdirSync(actualPath).filter(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+            if (videoFiles.length > 0) {
+              await registerLocalLink(historyItem.nzo_id, videoFiles[0], path.join(actualPath, videoFiles[0]));
+            }
+          } catch (err) {
+            log(this.name, `Warning: could not scan ${actualPath} for LocalLink registration: ${err.message}`);
           }
         }
       } else {
@@ -1771,6 +1776,9 @@ class LidarrMonitor extends ArrClient {
           const registered = await this.registerTrackFile(fullPath, album.id, track);
           if (registered) {
             registeredCount++;
+            // Note: path.basename(audioFile) is used; multi-disc sub-paths (e.g. CD1/track.flac) will
+            // return a 404 from nzbdav2 (DavItem parented under a subdirectory, not download root).
+            // This is logged as a warning and does not affect the import.
             await registerLocalLink(historyItem.nzo_id, path.basename(audioFile), fullPath);
           }
         } else {
