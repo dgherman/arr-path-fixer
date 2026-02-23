@@ -1135,28 +1135,33 @@ class SonarrMonitor extends ArrClient {
       return { id: episodeFileId };
     } catch (error) {
       log(this.name, `Error registering episode file via DB: ${error.message}`);
-      return null;
+      log(this.name, 'Falling back to API registration...');
+      return this.registerEpisodeFileViaApi(episodeFile, episodeIds);
     }
   }
 
   async registerEpisodeFileViaApi(episodeFile, episodeIds) {
     try {
-      // Fallback to API method (will fail on read-only filesystem)
-      const files = [{
+      // Use Sonarr v3 PUT /api/v3/manualimport to import specific files
+      const releaseGroupMatch = episodeFile.sceneName?.match(/-([A-Za-z0-9]+)$/);
+      const releaseGroup = releaseGroupMatch ? releaseGroupMatch[1] : (episodeFile.releaseGroup || '');
+
+      const importFiles = [{
         path: episodeFile.path,
         seriesId: episodeFile.seriesId,
         episodeIds: episodeIds,
-        quality: episodeFile.quality,
-        releaseGroup: episodeFile.releaseGroup || ''
+        quality: {
+          quality: episodeFile.quality?.quality || { id: 3, name: 'WEBDL-1080p' },
+          revision: { version: 1, real: 0, isRepack: false }
+        },
+        releaseGroup: releaseGroup,
+        languages: [{ id: 1, name: 'English' }],
+        importMode: 'auto',
+        indexerFlags: 0,
+        releaseType: 'singleEpisode'
       }];
 
-      const command = {
-        name: 'ManualImport',
-        files: files,
-        importMode: 'auto'
-      };
-
-      const response = await this.axios.post(`/api/${this.apiVersion}/command`, command);
+      const response = await this.axios.put(`/api/${this.apiVersion}/manualimport`, importFiles);
       return response.data;
     } catch (error) {
       log(this.name, `Error registering episode file via API: ${error.message}`);
