@@ -436,6 +436,25 @@ class ArrClient {
   }
 }
 
+// Register a LocalLink in nzbdav2 so Background Repairs can find imported files
+async function registerLocalLink(nzoId, fileName, linkPath) {
+  if (!CONFIG.nzbdav.apiKey) return;
+  try {
+    await axios.post(
+      `${CONFIG.nzbdav.url}/api/locallinks`,
+      { nzoId, fileName, linkPath },
+      {
+        headers: { 'x-api-key': CONFIG.nzbdav.apiKey },
+        timeout: 5000
+      }
+    );
+    log('NzbDAV', `LocalLink registered: ${fileName} → ${linkPath}`);
+  } catch (err) {
+    log('NzbDAV', `Warning: failed to register LocalLink for ${fileName}: ${err.message}`);
+    // Never throw — import success must not depend on this
+  }
+}
+
 // NzbDAV history fetcher - fetches all completed downloads
 async function fetchNzbdavHistory() {
   try {
@@ -603,6 +622,11 @@ class RadarrMonitor extends ArrClient {
           processedMovieIds.add(movie.id);
           // Clear any failed queue entries for this movie
           await this.clearFailedQueueEntries(item => item.movieId === movie.id);
+          // Scan actualPath for the video file to register in nzbdav2 LocalLinks
+          const videoFiles = fs.readdirSync(actualPath).filter(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+          if (videoFiles.length > 0) {
+            await registerLocalLink(historyItem.nzo_id, videoFiles[0], path.join(actualPath, videoFiles[0]));
+          }
         }
       } else {
         log(this.name, `[DRY RUN] Would update path and refresh`);
@@ -1231,6 +1255,7 @@ class SonarrMonitor extends ArrClient {
             item.seriesId === series.id &&
             item.episodeId === episode.id
           );
+          await registerLocalLink(historyItem.nzo_id, videoFile, fullPath);
         }
       } else {
         log(this.name, `[DRY RUN] Would register episode file: ${fullPath}`);
@@ -1746,6 +1771,7 @@ class LidarrMonitor extends ArrClient {
           const registered = await this.registerTrackFile(fullPath, album.id, track);
           if (registered) {
             registeredCount++;
+            await registerLocalLink(historyItem.nzo_id, path.basename(audioFile), fullPath);
           }
         } else {
           log(this.name, `[DRY RUN] Would register: ${fullPath}`);
