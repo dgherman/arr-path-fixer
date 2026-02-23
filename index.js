@@ -456,6 +456,30 @@ async function registerLocalLink(nzoId, fileName, linkPath) {
   }
 }
 
+// Register a LocalLink in nzbdav2 by the arr-side file path (no nzoId needed)
+// Returns 'ok' (registered), 'skip' (404/no match), or 'fail' (error)
+async function registerLocalLinkByPath(linkPath) {
+  if (!CONFIG.nzbdav.apiKey) return 'skip';
+  try {
+    const response = await axios.post(
+      `${CONFIG.nzbdav.url}/api/locallinks/register-by-link-path`,
+      { linkPath },
+      {
+        headers: { 'x-api-key': CONFIG.nzbdav.apiKey },
+        timeout: 5000,
+        validateStatus: status => status < 500
+      }
+    );
+    if (response.status === 200) return 'ok';
+    if (response.status === 404) return 'skip'; // DavItem not known to nzbdav2
+    log('NzbDAV', `Warning: register-by-link-path returned ${response.status} for ${path.basename(linkPath)}`);
+    return 'skip';
+  } catch (err) {
+    log('NzbDAV', `Warning: failed to register LocalLink by path for ${path.basename(linkPath)}: ${err.message}`);
+    return 'fail';
+  }
+}
+
 // NzbDAV history fetcher - fetches all completed downloads
 async function fetchNzbdavHistory() {
   try {
@@ -703,6 +727,19 @@ class RadarrMonitor extends ArrClient {
       log(this.name, `🧹 Cleaned up ${cleanedCount} stale movie files`);
     }
     return cleanedCount;
+  }
+
+  async backfillLocalLinks() {
+    const movies = await this.getAllMovies();
+    let registered = 0, skipped = 0, failed = 0;
+    for (const movie of movies) {
+      if (!movie.hasFile || !movie.movieFile?.path) { skipped++; continue; }
+      const result = await registerLocalLinkByPath(movie.movieFile.path);
+      if (result === 'ok') registered++;
+      else if (result === 'skip') skipped++;
+      else failed++;
+    }
+    log(this.name, `LocalLink backfill complete: ${registered} registered, ${skipped} skipped, ${failed} failed`);
   }
 }
 
@@ -1350,6 +1387,29 @@ class SonarrMonitor extends ArrClient {
 
     return cleanedCount;
   }
+
+  async backfillLocalLinks() {
+    const allSeries = await this.getAllSeries();
+    let registered = 0, skipped = 0, failed = 0;
+    for (const series of allSeries) {
+      let episodeFiles;
+      try {
+        const resp = await this.axios.get(`/api/${this.apiVersion}/episodefile`, { params: { seriesId: series.id } });
+        episodeFiles = resp.data || [];
+      } catch (err) {
+        log(this.name, `backfillLocalLinks: Failed to fetch episode files for "${series.title}": ${err.message}`);
+        continue;
+      }
+      for (const ef of episodeFiles) {
+        if (!ef.path) { skipped++; continue; }
+        const result = await registerLocalLinkByPath(ef.path);
+        if (result === 'ok') registered++;
+        else if (result === 'skip') skipped++;
+        else failed++;
+      }
+    }
+    log(this.name, `LocalLink backfill complete: ${registered} registered, ${skipped} skipped, ${failed} failed`);
+  }
 }
 
 // Lidarr-specific handler
@@ -1896,6 +1956,24 @@ class LidarrMonitor extends ArrClient {
 
     return cleanedCount;
   }
+
+  async backfillLocalLinks() {
+    const db = this.getDatabase();
+    if (!db) {
+      log(this.name, 'backfillLocalLinks: Database not available');
+      return;
+    }
+    let registered = 0, skipped = 0, failed = 0;
+    const trackFiles = db.prepare('SELECT Path FROM TrackFiles WHERE Path LIKE ?').all(this.config.mountPath + '%');
+    for (const tf of trackFiles) {
+      if (!tf.Path) { skipped++; continue; }
+      const result = await registerLocalLinkByPath(tf.Path);
+      if (result === 'ok') registered++;
+      else if (result === 'skip') skipped++;
+      else failed++;
+    }
+    log(this.name, `LocalLink backfill complete: ${registered} registered, ${skipped} skipped, ${failed} failed`);
+  }
 }
 
 // Plex symlink layer - presents nzbdav content in organized Show/Season/Episode structure
@@ -2205,6 +2283,9 @@ async function monitorAll() {
   let lastStaleCleanup = 0;
   const staleCleanupIntervalMs = 60 * 60 * 1000; // Run stale file cleanup every hour
 
+  let lastBackfill = 0;
+  const backfillIntervalMs = 24 * 60 * 60 * 1000; // Run LocalLink backfill once per day
+
   async function poll() {
     // Fetch NzbDAV history once
     const nzbdavHistory = await fetchNzbdavHistory();
@@ -2242,6 +2323,21 @@ async function monitorAll() {
         }
       }
       lastStaleCleanup = now;
+    }
+
+    // Run LocalLink backfill once per day (after startup grace period expires)
+    if (!isInStartupGracePeriod() && now - lastBackfill >= backfillIntervalMs) {
+      log('Main', 'Running LocalLink backfill...');
+      for (const monitor of monitors) {
+        try {
+          if (monitor.backfillLocalLinks) {
+            await monitor.backfillLocalLinks();
+          }
+        } catch (error) {
+          log(monitor.name, `Error in LocalLink backfill: ${error.message}`);
+        }
+      }
+      lastBackfill = now;
     }
   }
 
