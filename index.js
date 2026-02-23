@@ -436,6 +436,50 @@ class ArrClient {
   }
 }
 
+// Register a LocalLink in nzbdav2 so Background Repairs can find imported files
+async function registerLocalLink(nzoId, fileName, linkPath) {
+  if (!CONFIG.nzbdav.apiKey) return;
+  if (!nzoId) return;
+  try {
+    await axios.post(
+      `${CONFIG.nzbdav.url}/api/locallinks`,
+      { nzoId, fileName, linkPath },
+      {
+        headers: { 'x-api-key': CONFIG.nzbdav.apiKey },
+        timeout: 5000
+      }
+    );
+    log('NzbDAV', `LocalLink registered: ${fileName} → ${linkPath}`);
+  } catch (err) {
+    log('NzbDAV', `Warning: failed to register LocalLink for ${fileName}: ${err.message}`);
+    // Never throw — import success must not depend on this
+  }
+}
+
+// Register a LocalLink in nzbdav2 by the arr-side file path (no nzoId needed)
+// Returns 'ok' (registered), 'skip' (404/no match), or 'fail' (error)
+async function registerLocalLinkByPath(linkPath) {
+  if (!CONFIG.nzbdav.apiKey) return 'skip';
+  try {
+    const response = await axios.post(
+      `${CONFIG.nzbdav.url}/api/locallinks/register-by-link-path`,
+      { linkPath },
+      {
+        headers: { 'x-api-key': CONFIG.nzbdav.apiKey },
+        timeout: 5000,
+        validateStatus: status => status < 500
+      }
+    );
+    if (response.status === 200) return 'ok';
+    if (response.status === 404) return 'skip'; // DavItem not known to nzbdav2
+    log('NzbDAV', `Warning: register-by-link-path returned ${response.status} for ${path.basename(linkPath)}`);
+    return 'skip';
+  } catch (err) {
+    log('NzbDAV', `Warning: failed to register LocalLink by path for ${path.basename(linkPath)}: ${err.message}`);
+    return 'fail';
+  }
+}
+
 // NzbDAV history fetcher - fetches all completed downloads
 async function fetchNzbdavHistory() {
   try {
@@ -603,6 +647,15 @@ class RadarrMonitor extends ArrClient {
           processedMovieIds.add(movie.id);
           // Clear any failed queue entries for this movie
           await this.clearFailedQueueEntries(item => item.movieId === movie.id);
+          // Scan actualPath for the video file to register in nzbdav2 LocalLinks
+          try {
+            const videoFiles = fs.readdirSync(actualPath).filter(f => /\.(mkv|mp4|avi|mov)$/i.test(f));
+            if (videoFiles.length > 0) {
+              await registerLocalLink(historyItem.nzo_id, videoFiles[0], path.join(actualPath, videoFiles[0]));
+            }
+          } catch (err) {
+            log(this.name, `Warning: could not scan ${actualPath} for LocalLink registration: ${err.message}`);
+          }
         }
       } else {
         log(this.name, `[DRY RUN] Would update path and refresh`);
@@ -674,6 +727,19 @@ class RadarrMonitor extends ArrClient {
       log(this.name, `🧹 Cleaned up ${cleanedCount} stale movie files`);
     }
     return cleanedCount;
+  }
+
+  async backfillLocalLinks() {
+    const movies = await this.getAllMovies();
+    let registered = 0, skipped = 0, failed = 0;
+    for (const movie of movies) {
+      if (!movie.hasFile || !movie.movieFile?.path) { skipped++; continue; }
+      const result = await registerLocalLinkByPath(movie.movieFile.path);
+      if (result === 'ok') registered++;
+      else if (result === 'skip') skipped++;
+      else failed++;
+    }
+    log(this.name, `LocalLink backfill complete: ${registered} registered, ${skipped} skipped, ${failed} failed`);
   }
 }
 
@@ -1069,28 +1135,33 @@ class SonarrMonitor extends ArrClient {
       return { id: episodeFileId };
     } catch (error) {
       log(this.name, `Error registering episode file via DB: ${error.message}`);
-      return null;
+      log(this.name, 'Falling back to API registration...');
+      return this.registerEpisodeFileViaApi(episodeFile, episodeIds);
     }
   }
 
   async registerEpisodeFileViaApi(episodeFile, episodeIds) {
     try {
-      // Fallback to API method (will fail on read-only filesystem)
-      const files = [{
+      // Use Sonarr v3 PUT /api/v3/manualimport to import specific files
+      const releaseGroupMatch = episodeFile.sceneName?.match(/-([A-Za-z0-9]+)$/);
+      const releaseGroup = releaseGroupMatch ? releaseGroupMatch[1] : (episodeFile.releaseGroup || '');
+
+      const importFiles = [{
         path: episodeFile.path,
         seriesId: episodeFile.seriesId,
         episodeIds: episodeIds,
-        quality: episodeFile.quality,
-        releaseGroup: episodeFile.releaseGroup || ''
+        quality: {
+          quality: episodeFile.quality?.quality || { id: 3, name: 'WEBDL-1080p' },
+          revision: { version: 1, real: 0, isRepack: false }
+        },
+        releaseGroup: releaseGroup,
+        languages: [{ id: 1, name: 'English' }],
+        importMode: 'auto',
+        indexerFlags: 0,
+        releaseType: 'singleEpisode'
       }];
 
-      const command = {
-        name: 'ManualImport',
-        files: files,
-        importMode: 'auto'
-      };
-
-      const response = await this.axios.post(`/api/${this.apiVersion}/command`, command);
+      const response = await this.axios.post(`/api/${this.apiVersion}/manualimport`, importFiles);
       return response.data;
     } catch (error) {
       log(this.name, `Error registering episode file via API: ${error.message}`);
@@ -1231,6 +1302,7 @@ class SonarrMonitor extends ArrClient {
             item.seriesId === series.id &&
             item.episodeId === episode.id
           );
+          await registerLocalLink(historyItem.nzo_id, videoFile, fullPath);
         }
       } else {
         log(this.name, `[DRY RUN] Would register episode file: ${fullPath}`);
@@ -1281,29 +1353,29 @@ class SonarrMonitor extends ArrClient {
           log(this.name, `Stale file detected: "${ef.SeriesTitle}" - ${ef.RelativePath}`);
 
           if (!CONFIG.dryRun) {
-            // Get episode IDs before unlinking
             const episodeIds = ef.EpisodeIds ? ef.EpisodeIds.split(',').map(id => parseInt(id)) : [];
+            try {
+              // Delete via Sonarr API (handles episode unlinking automatically)
+              await this.axios.delete(`/api/${this.apiVersion}/episodefile/${ef.Id}`);
+              log(this.name, `Deleted stale episode file ID ${ef.Id} via API`);
 
-            // Unlink episodes from this file
-            db.prepare('UPDATE Episodes SET EpisodeFileId = 0 WHERE EpisodeFileId = ?').run(ef.Id);
-            // Delete the episode file record
-            db.prepare('DELETE FROM EpisodeFiles WHERE Id = ?').run(ef.Id);
-            log(this.name, `Deleted stale episode file record ID ${ef.Id}`);
-
-            // Only trigger search if series is monitored AND no replacement is already on the mount.
-            // If a replacement download already exists, processHistory will pick it up on the next poll.
-            if (ef.SeriesMonitored && episodeIds.length > 0) {
-              const replacementPath = this.findActualPath(ef.SeriesTitle, this.config.mountPath);
-              if (replacementPath) {
-                log(this.name, `Replacement already available at ${replacementPath} - skipping search, processHistory will handle it`);
-              } else {
-                await this.triggerCommand({ name: 'EpisodeSearch', episodeIds });
-                log(this.name, `Triggered search for ${episodeIds.length} episode(s)`);
+              // Only trigger search if series is monitored AND no replacement is already on the mount.
+              // If a replacement download already exists, processHistory will pick it up on the next poll.
+              if (ef.SeriesMonitored && episodeIds.length > 0) {
+                const replacementPath = this.findActualPath(ef.SeriesTitle, this.config.mountPath);
+                if (replacementPath) {
+                  log(this.name, `Replacement already available at ${replacementPath} - skipping search, processHistory will handle it`);
+                } else {
+                  await this.triggerCommand({ name: 'EpisodeSearch', episodeIds });
+                  log(this.name, `Triggered search for ${episodeIds.length} episode(s)`);
+                }
+              } else if (!ef.SeriesMonitored) {
+                log(this.name, `Skipping search for unmonitored series: ${ef.SeriesTitle}`);
               }
-            } else if (!ef.SeriesMonitored) {
-              log(this.name, `Skipping search for unmonitored series: ${ef.SeriesTitle}`);
+              cleanedCount++;
+            } catch (error) {
+              log(this.name, `Failed to delete episode file ${ef.Id} via API: ${error.message}`);
             }
-            cleanedCount++;
           } else {
             log(this.name, `[DRY RUN] Would delete stale file and trigger search`);
             cleanedCount++;
@@ -1319,6 +1391,29 @@ class SonarrMonitor extends ArrClient {
     }
 
     return cleanedCount;
+  }
+
+  async backfillLocalLinks() {
+    const allSeries = await this.getAllSeries();
+    let registered = 0, skipped = 0, failed = 0;
+    for (const series of allSeries) {
+      let episodeFiles;
+      try {
+        const resp = await this.axios.get(`/api/${this.apiVersion}/episodefile`, { params: { seriesId: series.id } });
+        episodeFiles = resp.data || [];
+      } catch (err) {
+        log(this.name, `backfillLocalLinks: Failed to fetch episode files for "${series.title}": ${err.message}`);
+        continue;
+      }
+      for (const ef of episodeFiles) {
+        if (!ef.path) { skipped++; continue; }
+        const result = await registerLocalLinkByPath(ef.path);
+        if (result === 'ok') registered++;
+        else if (result === 'skip') skipped++;
+        else failed++;
+      }
+    }
+    log(this.name, `LocalLink backfill complete: ${registered} registered, ${skipped} skipped, ${failed} failed`);
   }
 }
 
@@ -1746,6 +1841,10 @@ class LidarrMonitor extends ArrClient {
           const registered = await this.registerTrackFile(fullPath, album.id, track);
           if (registered) {
             registeredCount++;
+            // Note: path.basename(audioFile) is used; multi-disc sub-paths (e.g. CD1/track.flac) will
+            // return a 404 from nzbdav2 (DavItem parented under a subdirectory, not download root).
+            // This is logged as a warning and does not affect the import.
+            await registerLocalLink(historyItem.nzo_id, path.basename(audioFile), fullPath);
           }
         } else {
           log(this.name, `[DRY RUN] Would register: ${fullPath}`);
@@ -1818,20 +1917,22 @@ class LidarrMonitor extends ArrClient {
           log(this.name, `Stale file detected: "${tf.ArtistName}" - "${tf.AlbumTitle}" - ${path.basename(tf.Path)}`);
 
           if (!CONFIG.dryRun) {
-            // Unlink tracks from this file
-            db.prepare('UPDATE Tracks SET TrackFileId = 0 WHERE TrackFileId = ?').run(tf.Id);
-            // Delete the track file record
-            db.prepare('DELETE FROM TrackFiles WHERE Id = ?').run(tf.Id);
-            log(this.name, `Deleted stale track file record ID ${tf.Id}`);
+            try {
+              // Delete via Lidarr API (handles track unlinking automatically)
+              await this.axios.delete(`/api/${this.apiVersion}/trackfile/${tf.Id}`);
+              log(this.name, `Deleted stale track file ID ${tf.Id} via API`);
 
-            artistsToRefresh.add(tf.ArtistMetadataId);
-            // Only search for monitored albums
-            if (tf.AlbumMonitored) {
-              albumsToSearch.add(tf.AlbumId);
-            } else {
-              log(this.name, `Skipping search for unmonitored album: ${tf.AlbumTitle}`);
+              artistsToRefresh.add(tf.ArtistMetadataId);
+              // Only search for monitored albums
+              if (tf.AlbumMonitored) {
+                albumsToSearch.add(tf.AlbumId);
+              } else {
+                log(this.name, `Skipping search for unmonitored album: ${tf.AlbumTitle}`);
+              }
+              cleanedCount++;
+            } catch (error) {
+              log(this.name, `Failed to delete track file ${tf.Id} via API: ${error.message}`);
             }
-            cleanedCount++;
           } else {
             log(this.name, `[DRY RUN] Would delete stale file and trigger search`);
             cleanedCount++;
@@ -1859,6 +1960,24 @@ class LidarrMonitor extends ArrClient {
     }
 
     return cleanedCount;
+  }
+
+  async backfillLocalLinks() {
+    const db = this.getDatabase();
+    if (!db) {
+      log(this.name, 'backfillLocalLinks: Database not available');
+      return;
+    }
+    let registered = 0, skipped = 0, failed = 0;
+    const trackFiles = db.prepare('SELECT Path FROM TrackFiles WHERE Path LIKE ?').all(this.config.mountPath + '%');
+    for (const tf of trackFiles) {
+      if (!tf.Path) { skipped++; continue; }
+      const result = await registerLocalLinkByPath(tf.Path);
+      if (result === 'ok') registered++;
+      else if (result === 'skip') skipped++;
+      else failed++;
+    }
+    log(this.name, `LocalLink backfill complete: ${registered} registered, ${skipped} skipped, ${failed} failed`);
   }
 }
 
@@ -2169,6 +2288,9 @@ async function monitorAll() {
   let lastStaleCleanup = 0;
   const staleCleanupIntervalMs = 60 * 60 * 1000; // Run stale file cleanup every hour
 
+  let lastBackfill = 0;
+  const backfillIntervalMs = 24 * 60 * 60 * 1000; // Run LocalLink backfill once per day
+
   async function poll() {
     // Fetch NzbDAV history once
     const nzbdavHistory = await fetchNzbdavHistory();
@@ -2206,6 +2328,21 @@ async function monitorAll() {
         }
       }
       lastStaleCleanup = now;
+    }
+
+    // Run LocalLink backfill once per day (after startup grace period expires)
+    if (!isInStartupGracePeriod() && now - lastBackfill >= backfillIntervalMs) {
+      log('Main', 'Running LocalLink backfill...');
+      for (const monitor of monitors) {
+        try {
+          if (monitor.backfillLocalLinks) {
+            await monitor.backfillLocalLinks();
+          }
+        } catch (error) {
+          log(monitor.name, `Error in LocalLink backfill: ${error.message}`);
+        }
+      }
+      lastBackfill = now;
     }
   }
 
