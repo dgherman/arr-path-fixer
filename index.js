@@ -88,6 +88,8 @@ function extractTitleWords(str) {
     .replace(/\bs\d+e\d+\b/gi, ' ')
     // Replace separators with spaces
     .replace(/[._-]+/g, ' ')
+    // Remove apostrophes without adding space (preserves possessives: Bob's → Bobs)
+    .replace(/'/g, '')
     // Remove non-alphanumeric (keep spaces)
     .replace(/[^a-z0-9\s]/g, ' ')
     // Collapse whitespace and split
