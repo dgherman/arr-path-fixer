@@ -567,6 +567,15 @@ class RadarrMonitor extends ArrClient {
     const movies = await this.getAllMovies();
     const processedMovieIds = new Set(); // skip duplicate releases for the same movie in one poll
 
+    // Check mount health once per poll cycle - if mount is unhealthy, skip all
+    // inline stale checks to avoid falsely deleting records when the FUSE mount
+    // is disconnected (e.g. after rclone restarts without arr-path-fixer restart)
+    const mountCheck = isMountReady(this.config.mountPath);
+    if (!mountCheck.ready) {
+      log(this.name, `Mount not ready - skipping stale detection during history processing (${mountCheck.reason})`);
+    }
+    const mountHealthy = mountCheck.ready;
+
     for (const historyItem of nzbdavHistory) {
       const jobName = historyItem.job_name || historyItem.name || '';
       const category = (historyItem.category || historyItem.Category || '').toLowerCase();
@@ -605,8 +614,8 @@ class RadarrMonitor extends ArrClient {
       // If the file is gone (user replaced/deleted it), fall through to update the path.
       if (movie.hasFile) {
         const existingFilePath = movie.movieFile?.path;
-        if (!existingFilePath || fs.existsSync(existingFilePath)) {
-          continue; // File exists (or no path info) - nothing to do
+        if (!existingFilePath || !mountHealthy || fs.existsSync(existingFilePath)) {
+          continue; // File exists, mount unhealthy (skip stale check), or no path info
         }
         // File record exists in Radarr but the file is gone from disk (stale/replaced)
         log(this.name, `Stale file detected for "${movie.title}" (${path.basename(existingFilePath)}) - replacing with new download`);
@@ -897,7 +906,7 @@ class SonarrMonitor extends ArrClient {
     }
   }
 
-  async processSeasonPack(series, seasonNumber, downloadPath, jobName) {
+  async processSeasonPack(series, seasonNumber, downloadPath, jobName, mountHealthy = true) {
     log(this.name, `Processing season pack: ${series.title} Season ${seasonNumber}`);
 
     // Get all episodes for this series
@@ -962,15 +971,17 @@ class SonarrMonitor extends ArrClient {
 
       if (episode.hasFile) {
         let isStale = false;
-        const db = this.getDatabase();
-        if (db && episode.episodeFileId) {
-          try {
-            const ef = db.prepare('SELECT RelativePath FROM EpisodeFiles WHERE Id = ?').get(episode.episodeFileId);
-            if (ef) {
-              isStale = !fs.existsSync(path.join(this.config.mountPath, ef.RelativePath));
+        if (mountHealthy) {
+          const db = this.getDatabase();
+          if (db && episode.episodeFileId) {
+            try {
+              const ef = db.prepare('SELECT RelativePath FROM EpisodeFiles WHERE Id = ?').get(episode.episodeFileId);
+              if (ef) {
+                isStale = !fs.existsSync(path.join(this.config.mountPath, ef.RelativePath));
+              }
+            } catch (err) {
+              // DB lookup failed - assume file exists and skip
             }
-          } catch (err) {
-            // DB lookup failed - assume file exists and skip
           }
         }
         if (!isStale) {
@@ -1180,6 +1191,15 @@ class SonarrMonitor extends ArrClient {
   async processHistory(nzbdavHistory) {
     const allSeries = await this.getAllSeries();
 
+    // Check mount health once per poll cycle - if mount is unhealthy, skip all
+    // inline stale checks to avoid falsely deleting records when the FUSE mount
+    // is disconnected (e.g. after rclone restarts without arr-path-fixer restart)
+    const mountCheck = isMountReady(this.config.mountPath);
+    if (!mountCheck.ready) {
+      log(this.name, `Mount not ready - skipping stale detection during history processing (${mountCheck.reason})`);
+    }
+    const mountHealthy = mountCheck.ready;
+
     for (const historyItem of nzbdavHistory) {
       const jobName = historyItem.job_name || historyItem.name || '';
       const category = (historyItem.category || historyItem.Category || '').toLowerCase();
@@ -1216,7 +1236,7 @@ class SonarrMonitor extends ArrClient {
 
       // Handle season packs differently from individual episodes
       if (seasonInfo) {
-        await this.processSeasonPack(series, seasonInfo.season, downloadPath, jobName);
+        await this.processSeasonPack(series, seasonInfo.season, downloadPath, jobName, mountHealthy);
         continue;
       }
 
@@ -1230,15 +1250,17 @@ class SonarrMonitor extends ArrClient {
       // Check if episode already has a file AND the file actually exists on disk
       if (episode.hasFile) {
         let isStale = false;
-        const db = this.getDatabase();
-        if (db && episode.episodeFileId) {
-          try {
-            const ef = db.prepare('SELECT RelativePath FROM EpisodeFiles WHERE Id = ?').get(episode.episodeFileId);
-            if (ef) {
-              isStale = !fs.existsSync(path.join(this.config.mountPath, ef.RelativePath));
+        if (mountHealthy) {
+          const db = this.getDatabase();
+          if (db && episode.episodeFileId) {
+            try {
+              const ef = db.prepare('SELECT RelativePath FROM EpisodeFiles WHERE Id = ?').get(episode.episodeFileId);
+              if (ef) {
+                isStale = !fs.existsSync(path.join(this.config.mountPath, ef.RelativePath));
+              }
+            } catch (err) {
+              // DB lookup failed - assume file exists and skip
             }
-          } catch (err) {
-            // DB lookup failed - assume file exists and skip
           }
         }
         if (!isStale) {
