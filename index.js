@@ -755,6 +755,12 @@ class SonarrMonitor extends ArrClient {
   }
 
   async triggerSearchForIncompleteDownload(series, episode, originalRelease) {
+    // Don't trigger searches for unmonitored episodes
+    if (episode.monitored === false) {
+      log(this.name, `Skipping search for unmonitored episode: "${series.title}" S${episode.seasonNumber}E${episode.episodeNumber}`);
+      return;
+    }
+
     const searchKey = `${series.id}-${episode.seasonNumber}-${episode.episodeNumber}`;
     const lastSearch = this.recentlySearched.get(searchKey);
 
