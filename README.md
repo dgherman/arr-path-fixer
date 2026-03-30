@@ -219,6 +219,12 @@ podman logs -f arr-path-fixer
               └──────────┘
 ```
 
+## Changelog
+
+### 2026-03-30
+- **Fix stale FUSE mount detection**: `isMountReady` now uses `fs.statSync` instead of `fs.existsSync` so ENOTCONN from a dead FUSE device throws rather than returning false (which was silently misinterpreted as "path doesn't exist"). ENOTCONN and ENODEV errors are now flagged as fatal.
+- **Auto-restart on dead mount**: `poll()` now calls `isMountReady` before each poll cycle. If the mount is stale (ENOTCONN), the process exits with code 1 so Docker restarts it with a fresh bind to the current FUSE device. Previously, stale mounts caused false "download appears incomplete" reports and triggered unnecessary re-downloads.
+
 ## License
 
 MIT

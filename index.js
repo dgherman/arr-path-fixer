@@ -151,9 +151,9 @@ function findBestMatch(targetTitle, targetYear, items, getTitleFn, getYearFn = n
 // Validate that a mount path is ready and populated (not an empty/stale VFS cache)
 function isMountReady(mountPath, minExpectedFiles = 1) {
   try {
-    if (!fs.existsSync(mountPath)) {
-      return { ready: false, reason: 'Mount path does not exist' };
-    }
+    // Use statSync (not existsSync) so ENOTCONN from a stale FUSE mount throws instead of
+    // silently returning false, which would be misinterpreted as "path doesn't exist".
+    fs.statSync(mountPath);
 
     // Check if we can read the directory
     const entries = fs.readdirSync(mountPath, { withFileTypes: true });
@@ -177,9 +177,12 @@ function isMountReady(mountPath, minExpectedFiles = 1) {
       return { ready: false, reason: `Mount appears empty or still populating (found ${fileCount} entries)` };
     }
 
-    return { ready: true, reason: null };
+    return { ready: true, reason: null, fatal: false };
   } catch (error) {
-    return { ready: false, reason: `Error checking mount: ${error.message}` };
+    // ENOTCONN / ENODEV = stale FUSE device (rclone restarted without arr-path-fixer restarting).
+    // This is fatal: the process must exit so Docker can restart it with a fresh mount.
+    const fatal = error.code === 'ENOTCONN' || error.code === 'ENODEV';
+    return { ready: false, reason: `Error checking mount: ${error.message}`, fatal };
   }
 }
 
@@ -2322,6 +2325,23 @@ async function monitorAll() {
   const backfillIntervalMs = 24 * 60 * 60 * 1000; // Run LocalLink backfill once per day
 
   async function poll() {
+    // Check mount health before doing anything. A stale FUSE device (ENOTCONN) means rclone
+    // restarted but we're still bound to the old device — no file ops will work. Exit so
+    // Docker restarts this container and it picks up the live FUSE mount.
+    for (const monitor of monitors) {
+      if (monitor.config && monitor.config.mountPath) {
+        const mountCheck = isMountReady(monitor.config.mountPath);
+        if (!mountCheck.ready) {
+          if (mountCheck.fatal) {
+            log('Main', `[FATAL] Stale/dead mount at ${monitor.config.mountPath}: ${mountCheck.reason} — exiting for container restart`);
+            process.exit(1);
+          }
+          log('Main', `Mount not ready at ${monitor.config.mountPath}: ${mountCheck.reason} — skipping poll`);
+          return;
+        }
+      }
+    }
+
     // Fetch NzbDAV history once
     const nzbdavHistory = await fetchNzbdavHistory();
     log('Main', `Found ${nzbdavHistory.length} completed downloads in NzbDAV history`);
